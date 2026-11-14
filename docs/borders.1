@@ -111,6 +111,33 @@ Since inactive borders are not kept alive in this mode, \fIinactive_color\fR
 has no visible effect.\& The setting can be changed at runtime.\&
 .PP
 .RE
+\fBfade=<boolean>\fR
+.RS 4
+If set to \fIon\fR, the focused border fades out after \fIfade_delay\fR seconds
+and stays hidden until the focus changes.\& The default is \fIoff\fR, which
+keeps the border permanently visible.\& Only the focused border fades;
+inactive borders keep their normal appearance, and moving, resizing or
+switching Spaces does not show a faded border again.\& To hide inactive
+borders as well, combine it with \fIactive_only=on\fR or a transparent
+\fIinactive_color\fR.\& This process-wide setting can be changed at runtime and
+cannot be combined with \fIapply-to=<window-id>\fR.\&
+.PP
+.RE
+\fBfade_delay=<seconds>\fR
+.RS 4
+How long the focused border stays fully visible before it starts to
+fade (default 2.\&0).\& Must be greater than 0 and at most 3600.\& Only used
+with \fIfade=on\fR.\& This process-wide setting cannot be combined with
+\fIapply-to=<window-id>\fR.\&
+.PP
+.RE
+\fBfade_duration=<milliseconds>\fR
+.RS 4
+How long the fade itself takes (default 300).\& Must be between 0 and 10000;
+0 hides the border at once after the delay.\& Only used with \fIfade=on\fR.\& This
+process-wide setting cannot be combined with \fIapply-to=<window-id>\fR.\&
+.PP
+.RE
 \fBax_focus=<boolean>\fR
 .RS 4
 If set to \fIon\fR, the (slower) accessibility API is used to resolve the

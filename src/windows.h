@@ -36,3 +36,4 @@ void windows_adaptive_mode_changed(struct table* windows,
                                    enum adaptive_color_mode current);
 void windows_adaptive_refresh_active(struct table* windows);
 void windows_adaptive_space_change_started(struct table* windows);
+void windows_fade_settings_changed(struct table* windows);

@@ -93,8 +93,11 @@ static bool yabai_restore_parent_alpha(struct border* border) {
   // This is a single-window restore, so use the direct API whose CGError is
   // meaningful. The transaction variant leaves an unspecified return value in
   // the register on macOS 26 and cannot be used as a success predicate.
-  return SLSSetWindowAlpha(border->cid, border->wid, 1.f)
-         == kCGErrorSuccess;
+  // A faded focused border must stay faded; fade_alpha is 1 when inactive.
+  float alpha = border->fade_alpha;
+  CGError error = SLSSetWindowAlpha(border->cid, border->wid, alpha);
+  if (error == kCGErrorSuccess) border->fade_alpha_wid = border->wid;
+  return error == kCGErrorSuccess;
 }
 
 static void yabai_retry_parent_alpha(struct table* windows,

@@ -449,6 +449,89 @@ static void windows_remove_all_except(struct table* windows, uint32_t wid) {
   if (removed_window) windows_update_notifications(windows);
 }
 
+// Fade-out of the focused border. Everything below runs on the main dispatch
+// queue. Delayed steps carry only {wid, generation, start}; they re-resolve the
+// border through g_windows, so a destroyed or reused border can never be
+// touched through a stale pointer, and any newer focus, focus loss, settings
+// change or destruction invalidates them through the generation token.
+static uint64_t fade_generation;
+
+struct fade_token {
+  uint32_t wid;
+  uint64_t generation;
+  uint64_t start_ns;
+};
+
+static void windows_fade_set_alpha(struct border* border, float alpha) {
+  pthread_mutex_lock(&border->mutex);
+  // While a yabai proxy stands in for the border, the parent helper must stay
+  // transparent; yabai_restore_parent_alpha applies fade_alpha afterwards.
+  bool proxied = border->proxy || border->external_proxy_wid;
+  bool changed = alpha != border->fade_alpha
+                 || (border->wid != border->fade_alpha_wid && alpha != 1.0f);
+  if (border->wid && changed && !proxied) {
+    SLSSetWindowAlpha(border->cid, border->wid, alpha);
+    border->fade_alpha_wid = border->wid;
+  }
+  border->fade_alpha = alpha;
+  pthread_mutex_unlock(&border->mutex);
+}
+
+static void windows_fade_schedule(struct fade_token token, uint64_t delay_ns) {
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)delay_ns),
+                 dispatch_get_main_queue(),
+                 ^{
+    uint32_t wid = token.wid;
+    struct border* border = table_find(&g_windows, &wid);
+    if (!border
+        || !fade_token_matches(token.generation,
+                               border->fade_generation,
+                               border->focused,
+                               border->destroying,
+                               g_settings.fade.enabled)) {
+      return;
+    }
+
+    uint64_t now = windows_adaptive_now_ns();
+    uint64_t elapsed = now > token.start_ns ? now - token.start_ns : 0;
+    float alpha = fade_alpha_at(&g_settings.fade, elapsed);
+    windows_fade_set_alpha(border, alpha);
+    if (alpha > 0.0f) windows_fade_schedule(token, FADE_STEP_NS);
+  });
+}
+
+static void windows_fade_cancel(struct border* border) {
+  border->fade_generation = fade_next_generation(fade_generation);
+  fade_generation = border->fade_generation;
+  windows_fade_set_alpha(border, 1.0f);
+}
+
+static void windows_fade_restart(struct border* border) {
+  windows_fade_cancel(border);
+  if (!g_settings.fade.enabled || !border->focused || border->destroying) {
+    return;
+  }
+
+  struct fade_token token = { .wid = border->target_wid,
+                              .generation = border->fade_generation,
+                              .start_ns = windows_adaptive_now_ns() };
+  windows_fade_schedule(token, fade_delay_ns(&g_settings.fade));
+}
+
+void windows_fade_settings_changed(struct table* windows) {
+  for (int i = 0; i < windows->capacity; ++i) {
+    struct bucket* bucket = windows->buckets[i];
+    while (bucket) {
+      if (bucket->value) {
+        struct border* border = bucket->value;
+        if (border->focused) windows_fade_restart(border);
+        else windows_fade_cancel(border);
+      }
+      bucket = bucket->next;
+    }
+  }
+}
+
 static bool windows_window_create_internal(struct table* windows,
                                            uint32_t wid,
                                            uint64_t sid,
@@ -489,6 +572,9 @@ static bool windows_window_create_internal(struct table* windows,
               CFRelease(target_ref);
               return false;
             }
+            // Zero-initialised borders would read as fully transparent;
+            // fade_alpha records the helper alpha, 1 meaning untouched.
+            border->fade_alpha = 1.0f;
             window_created = true;
           }
 
@@ -655,6 +741,7 @@ static bool windows_window_focus(struct table* windows, uint32_t wid) {
         if (border != target && border->focused) {
           border->focused = false;
           windows_adaptive_invalidate_border(border, false);
+          windows_fade_cancel(border);
           if (!g_settings.active_only) {
             border->needs_redraw = true;
             if (!border_update(border, true)) border_hide(border);
@@ -666,6 +753,7 @@ static bool windows_window_focus(struct table* windows, uint32_t wid) {
   }
 
   if (newly_focused) {
+    windows_fade_restart(target);
     windows_adaptive_schedule_border(target, ADAPTIVE_FOCUS_DEBOUNCE_MS);
   }
 

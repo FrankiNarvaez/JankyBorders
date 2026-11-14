@@ -162,6 +162,12 @@ static void message_handler(void* data, uint32_t len) {
   } else if (update_mask & BORDER_UPDATE_MASK_INACTIVE) {
     windows_update_inactive(&g_windows);
   }
+
+  // Runs after any redraw/recreate so the focused border restarts its fade
+  // cycle with the new delay/duration (or returns to full alpha when off).
+  if (update_mask & BORDER_UPDATE_MASK_FADE) {
+    windows_fade_settings_changed(&g_windows);
+  }
 }
 
 static int screen_capture_command(const char* option) {

@@ -139,6 +139,14 @@ struct border {
   struct adaptive_color_cache adaptive_color_cache;
   struct adaptive_color_switch_confirmation adaptive_color_confirmation;
 
+  // Focused-border fade (see windows.c). fade_alpha is the helper alpha last
+  // requested; windows.c sets it to 1.0f when the border is created (the
+  // struct is zero-initialised). fade_alpha_wid is the helper window it was
+  // applied to, and fade_generation invalidates delayed fade steps.
+  uint64_t fade_generation;
+  float fade_alpha;
+  uint32_t fade_alpha_wid;
+
   struct settings setting_override;
 };
 

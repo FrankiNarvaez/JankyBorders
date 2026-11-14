@@ -159,6 +159,23 @@ options=(
 borders "${options[@]}"
 ```
 
+#### Fading the focused border
+
+Fading is disabled by default. With `fade=on`, the focused border stays fully
+visible for `fade_delay` seconds (default `2.0`, greater than 0 and at most
+3600), then fades out over `fade_duration` milliseconds (default `300`, from 0
+to 10000; `0` hides it at once). Only the focused border fades, and it
+reappears only when the focus changes, not on move, resize or Space switch.
+To hide inactive borders as well, combine it with `active_only=on` or a
+transparent `inactive_color`.
+
+```bash
+borders active_only=on fade=on fade_delay=1.5 fade_duration=400
+```
+
+`fade`, `fade_delay` and `fade_duration` are process-wide settings, can be
+changed at runtime, and cannot be combined with `apply-to=<window-id>`.
+
 #### Adapting the focused border to window-edge colors
 
 Adaptive color is disabled by default. It provides two process-wide sampling

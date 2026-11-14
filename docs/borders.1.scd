@@ -86,6 +86,27 @@ verification boundary.
 	Since inactive borders are not kept alive in this mode, _inactive_color_
 	has no visible effect. The setting can be changed at runtime.
 
+*fade=<boolean>*
+	If set to _on_, the focused border fades out after _fade_delay_ seconds
+	and stays hidden until the focus changes. The default is _off_, which
+	keeps the border permanently visible. Only the focused border fades;
+	inactive borders keep their normal appearance, and moving, resizing or
+	switching Spaces does not show a faded border again. To hide inactive
+	borders as well, combine it with _active_only=on_ or a transparent
+	_inactive_color_. This process-wide setting can be changed at runtime and
+	cannot be combined with _apply-to=<window-id>_.
+
+*fade_delay=<seconds>*
+	How long the focused border stays fully visible before it starts to
+	fade (default 2.0). Must be greater than 0 and at most 3600. Only used
+	with _fade=on_. This process-wide setting cannot be combined with
+	_apply-to=<window-id>_.
+
+*fade_duration=<milliseconds>*
+	How long the fade itself takes (default 300). Must be between 0 and 10000;
+	0 hides the border at once after the delay. Only used with _fade=on_. This
+	process-wide setting cannot be combined with _apply-to=<window-id>_.
+
 *ax_focus=<boolean>*
 	If set to _on_, the (slower) accessibility API is used to resolve the
 	focused window. Enabled automatically if the (parent) process has

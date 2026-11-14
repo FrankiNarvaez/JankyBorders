@@ -127,6 +127,41 @@ static void test_unrelated_arguments_are_not_fade_arguments(void) {
   assert(fade_argument_is_fade("fade_delay=bad"));
 }
 
+static void test_parse_edges_keep_config_unchanged(void) {
+  struct fade_config config = FADE_CONFIG_DEFAULT;
+  struct fade_config before = config;
+  static const char* invalid[] = {
+    "fade=ON",
+    "fade=1",
+    "fade= on",
+    "fade_delay=-0",
+    "fade_delay=+2",
+    "fade_delay= 2",
+    "fade_delay=2 ",
+    "fade_delay=0x10",
+    "fade_delay=1e1",
+    "fade_delay=1e-50",
+    "fade_delay=3600.001",
+    "fade_delay=.",
+    "fade_duration=-0",
+    "fade_duration=-0.1",
+    "fade_duration=10000.01",
+    "fade_duration=0x10",
+  };
+  for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+    assert(fade_parse_argument(invalid[i], &config)
+           == FADE_ARGUMENT_INVALID);
+    assert(config_equals(config, before));
+  }
+
+  assert(fade_parse_argument("fade_delay=0.0001", &config)
+         == FADE_ARGUMENT_VALID);
+  assert(config.delay_s == 0.0001f);
+  assert(fade_parse_argument("fade_delay=.5", &config)
+         == FADE_ARGUMENT_VALID);
+  assert(config.delay_s == 0.5f);
+}
+
 static void test_alpha_curve(void) {
   struct fade_config config = sample_config();
   uint64_t delay_ns = fade_delay_ns(&config);
@@ -180,6 +215,7 @@ int main(void) {
   test_delay_parsing_and_bounds();
   test_duration_parsing_and_bounds();
   test_unrelated_arguments_are_not_fade_arguments();
+  test_parse_edges_keep_config_unchanged();
   test_alpha_curve();
   test_zero_duration_hides_at_once();
   test_tokens_reject_stale_or_retired_borders();

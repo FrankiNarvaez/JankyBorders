@@ -192,7 +192,9 @@ static bool yabai_proxy_activate(struct border* border,
                             proxy->effective_order,
                             external_proxy_wid);
   SLSTransactionSetWindowAlpha(transaction, border->wid, 0.f);
-  SLSTransactionSetWindowAlpha(transaction, proxy->wid, 1.f);
+  // The proxy stands in for the border during the animation, so it inherits
+  // the fade state: a faded focused border must not flash back.
+  SLSTransactionSetWindowAlpha(transaction, proxy->wid, border->fade_alpha);
   SLSTransactionCommit(transaction, 0);
   CFRelease(transaction);
 

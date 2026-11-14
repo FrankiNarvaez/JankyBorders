@@ -1,6 +1,5 @@
 #pragma once
 
-#include <ctype.h>
 #include <errno.h>
 #include <math.h>
 #include <stdbool.h>
@@ -39,7 +38,10 @@ static inline bool fade_parse_bounded_float(const char* number,
                                             bool minimum_inclusive,
                                             float maximum,
                                             float* value) {
-  if (!number || *number == '\0' || isspace((unsigned char)*number)) {
+  // Plain decimals only: no sign, whitespace, exponent, hex, nan or inf.
+  if (!number || *number == '\0'
+      || strspn(number, "0123456789.") != strlen(number)
+      || strspn(number, ".") == strlen(number)) {
     return false;
   }
 

@@ -465,11 +465,16 @@ struct fade_token {
 static void windows_fade_set_alpha(struct border* border, float alpha) {
   pthread_mutex_lock(&border->mutex);
   // While a yabai proxy stands in for the border, the parent helper must stay
-  // transparent; yabai_restore_parent_alpha applies fade_alpha afterwards.
+  // transparent; the proxy shows the fade instead, and
+  // yabai_restore_parent_alpha applies fade_alpha to the parent afterwards.
   bool proxied = border->proxy || border->external_proxy_wid;
   bool changed = alpha != border->fade_alpha
                  || (border->wid != border->fade_alpha_wid && alpha != 1.0f);
-  if (border->wid && changed && !proxied) {
+  if (changed && proxied) {
+    if (border->proxy && border->proxy->wid) {
+      SLSSetWindowAlpha(border->proxy->cid, border->proxy->wid, alpha);
+    }
+  } else if (border->wid && changed) {
     SLSSetWindowAlpha(border->cid, border->wid, alpha);
     border->fade_alpha_wid = border->wid;
   }
@@ -500,9 +505,14 @@ static void windows_fade_schedule(struct fade_token token, uint64_t delay_ns) {
   });
 }
 
-static void windows_fade_cancel(struct border* border) {
+// Invalidates pending fade steps without touching the helper alpha.
+static void windows_fade_invalidate(struct border* border) {
   border->fade_generation = fade_next_generation(fade_generation);
   fade_generation = border->fade_generation;
+}
+
+static void windows_fade_cancel(struct border* border) {
+  windows_fade_invalidate(border);
   windows_fade_set_alpha(border, 1.0f);
 }
 
@@ -741,10 +751,15 @@ static bool windows_window_focus(struct table* windows, uint32_t wid) {
         if (border != target && border->focused) {
           border->focused = false;
           windows_adaptive_invalidate_border(border, false);
-          windows_fade_cancel(border);
+          // Restore full alpha only after the inactive redraw, so a faded
+          // border never flashes back in the active color. Active-only
+          // borders are hidden or removed instead; a later focus restores
+          // them through windows_fade_restart.
+          windows_fade_invalidate(border);
           if (!g_settings.active_only) {
             border->needs_redraw = true;
             if (!border_update(border, true)) border_hide(border);
+            windows_fade_set_alpha(border, 1.0f);
           }
         }
       }

@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "border.h"
 #include "hashtable.h"
@@ -401,6 +402,85 @@ static void test_filter_scope(void) {
   table_free(&g_whitelist);
 }
 
+static uint32_t parse_settings_capturing_stdout(struct settings* settings,
+                                               int count,
+                                               char** arguments,
+                                               char* output,
+                                               size_t output_size) {
+  fflush(stdout);
+  FILE* capture = tmpfile();
+  assert(capture);
+  int saved_stdout = dup(STDOUT_FILENO);
+  assert(saved_stdout >= 0);
+  assert(dup2(fileno(capture), STDOUT_FILENO) >= 0);
+
+  uint32_t mask = parse_settings(settings, count, arguments);
+
+  fflush(stdout);
+  assert(dup2(saved_stdout, STDOUT_FILENO) >= 0);
+  close(saved_stdout);
+  rewind(capture);
+  size_t length = fread(output, 1, output_size - 1, capture);
+  output[length] = '\0';
+  fclose(capture);
+  return mask;
+}
+
+static void test_fade_settings(void) {
+  struct settings settings = { .fade = FADE_CONFIG_DEFAULT };
+  char output[256];
+
+  char* enable[] = { "fade=on", "fade_delay=1.5", "fade_duration=400" };
+  uint32_t mask = parse_settings_capturing_stdout(&settings, 3, enable,
+                                                  output, sizeof(output));
+  assert(mask == BORDER_UPDATE_MASK_FADE);
+  assert(strcmp(output, "") == 0);
+  assert(settings.fade.enabled);
+  assert(settings.fade.delay_s == 1.5f);
+  assert(settings.fade.duration_ms == 400.0f);
+
+  char* disable[] = { "fade=off" };
+  mask = parse_settings(&settings, 1, disable);
+  assert(mask == BORDER_UPDATE_MASK_FADE);
+  assert(!settings.fade.enabled);
+  assert(settings.fade.delay_s == 1.5f);
+
+  struct settings before = settings;
+  char* invalid[] = { "fade_delay=0" };
+  mask = parse_settings_capturing_stdout(&settings, 1, invalid,
+                                         output, sizeof(output));
+  assert(mask == 0);
+  assert(strcmp(output,
+                "[?] Borders: Invalid argument 'fade_delay=0'\n") == 0);
+  assert(memcmp(&settings.fade, &before.fade, sizeof(before.fade)) == 0);
+
+  char* invalid_toggle[] = { "fade=maybe" };
+  mask = parse_settings_capturing_stdout(&settings, 1, invalid_toggle,
+                                         output, sizeof(output));
+  assert(mask == 0);
+  assert(strcmp(output,
+                "[?] Borders: Invalid argument 'fade=maybe'\n") == 0);
+  assert(memcmp(&settings.fade, &before.fade, sizeof(before.fade)) == 0);
+
+  // Fade is process-wide: it cannot target one window.
+  char* fade_override[] = { "fade=on", "apply-to=42" };
+  assert(parse_settings_contains_global_control(2, fade_override));
+  assert(!parse_settings_scope_is_valid(2, fade_override));
+  char* delay_override[] = { "apply-to=42", "fade_delay=3" };
+  assert(!parse_settings_scope_is_valid(2, delay_override));
+  char* duration_override[] = { "fade_duration=bad", "apply-to=42" };
+  assert(!parse_settings_scope_is_valid(2, duration_override));
+  char* global_fade[] = { "fade=on", "width=7" };
+  assert(parse_settings_scope_is_valid(2, global_fade));
+
+  // Broadcasts re-applied to per-window overrides leave fade untouched.
+  struct settings local_override = { .fade = FADE_CONFIG_DEFAULT };
+  char* fade_update[] = { "fade=on", "fade_delay=9" };
+  assert(parse_settings_override(&local_override, 2, fade_update) == 0);
+  assert(!local_override.fade.enabled);
+  assert(local_override.fade.delay_s == 2.0f);
+}
+
 static void test_cfnumber_arrays(void) {
   CFArrayRef empty = cfarray_of_cfnumbers(NULL,
                                           sizeof(uint64_t),
@@ -454,6 +534,7 @@ int main(void) {
   test_invalid_mach_message_cleanup();
   test_owned_mach_port_cleanup();
   test_filter_scope();
+  test_fade_settings();
   test_cfnumber_arrays();
   test_hashtable_fail_closed();
   puts("safety tests passed");

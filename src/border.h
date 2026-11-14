@@ -9,6 +9,7 @@
 #include "adaptive_color.h"
 #include "hashtable.h"
 #include "mission_control.h"
+#include "fade.h"
 
 #define BORDER_ORDER_ABOVE 1
 #define BORDER_ORDER_BELOW -1
@@ -73,6 +74,7 @@ struct settings {
   bool ax_focus;
   bool active_only;
   enum adaptive_color_mode adaptive_color;
+  struct fade_config fade;
 };
 
 // Borders are intentionally hidden either by style=none or, process-wide,

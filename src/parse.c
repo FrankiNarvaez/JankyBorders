@@ -434,6 +434,16 @@ static uint32_t parse_settings_internal(struct settings* settings,
         update_mask |= BORDER_UPDATE_MASK_ADAPTIVE;
       }
     }
+    else if (fade_argument_is_fade(arguments[i])) {
+      if (global_controls) {
+        if (fade_parse_argument(arguments[i], &settings->fade)
+            == FADE_ARGUMENT_VALID) {
+          update_mask |= BORDER_UPDATE_MASK_FADE;
+        } else {
+          printf("[?] Borders: Invalid argument '%s'\n", arguments[i]);
+        }
+      }
+    }
     else if (str_starts_with(arguments[i], "apply-to=")) {
       uint32_t apply_to = 0;
       if (global_controls
@@ -484,6 +494,7 @@ bool parse_settings_contains_global_control(int count, char** arguments) {
     if (active_only_parse_argument(arguments[i], &enabled)) return true;
     if (arguments[i]
         && str_starts_with(arguments[i], "adaptive_color=")) return true;
+    if (fade_argument_is_fade(arguments[i])) return true;
   }
   return false;
 }

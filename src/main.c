@@ -59,7 +59,8 @@ struct settings g_settings = { .enabled = true,
                                .border_order = BORDER_ORDER_BELOW,
                                .ax_focus = false,
                                .active_only = false,
-                               .adaptive_color = ADAPTIVE_COLOR_MODE_OFF     };
+                               .adaptive_color = ADAPTIVE_COLOR_MODE_OFF,
+                               .fade = FADE_CONFIG_DEFAULT                   };
 
 bool g_blacklist_enabled = false;
 struct table g_blacklist;

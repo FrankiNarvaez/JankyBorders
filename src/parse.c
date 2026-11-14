@@ -1,6 +1,10 @@
 #include "parse.h"
+#include "active_only.h"
 #include "border.h"
 #include "hashtable.h"
+#include <errno.h>
+#include <math.h>
+#include <stdlib.h>
 
 static bool str_starts_with(char* string, char* prefix) {
   if (!string || !prefix) return false;
@@ -9,105 +13,385 @@ static bool str_starts_with(char* string, char* prefix) {
   return false;
 }
 
-static bool parse_list(struct table* list, char* token) {
-  uint32_t token_len = strlen(token) + 1;
-  char copy[token_len];
-  memcpy(copy, token, token_len);
+static bool parse_u32_argument(const char* argument,
+                               const char* prefix,
+                               uint32_t* value) {
+  if (!argument || !prefix || !value) return false;
+  size_t prefix_length = strlen(prefix);
+  if (strncmp(argument, prefix, prefix_length) != 0) return false;
+
+  const char* number = argument + prefix_length;
+  if (*number < '0' || *number > '9') return false;
+  errno = 0;
+  char* end = NULL;
+  unsigned long parsed = strtoul(number, &end, 10);
+  if (errno != 0 || !end || *end != '\0' || parsed > UINT32_MAX) return false;
+  *value = (uint32_t)parsed;
+  return true;
+}
+
+static bool parse_width_argument(const char* argument, float* width) {
+  static const char prefix[] = "width=";
+  if (!argument || !width
+      || strncmp(argument, prefix, sizeof(prefix) - 1) != 0) {
+    return false;
+  }
+
+  const char* number = argument + sizeof(prefix) - 1;
+  if (*number == '\0') return false;
+
+  errno = 0;
+  char* end = NULL;
+  float parsed = strtof(number, &end);
+  if (errno == ERANGE
+      || end == number
+      || !end
+      || *end != '\0'
+      || !isfinite(parsed)
+      || parsed <= 0.0f) {
+    return false;
+  }
+
+  *width = parsed;
+  return true;
+}
+
+static bool parse_order_argument(const char* argument, int* order) {
+  if (!argument || !order) return false;
+  if (strcmp(argument, "order=above") == 0) {
+    *order = BORDER_ORDER_ABOVE;
+    return true;
+  }
+  if (strcmp(argument, "order=below") == 0) {
+    *order = BORDER_ORDER_BELOW;
+    return true;
+  }
+  return false;
+}
+
+static bool parse_list(struct table* list, char* token, bool* enabled) {
+  if (!list || !token || !enabled) return false;
+
+  size_t token_len = strlen(token);
+  if (token_len == SIZE_MAX) return false;
+
+  char* copy = malloc(token_len + 1);
+  if (!copy) return false;
+  memcpy(copy, token, token_len + 1);
+
+  struct table parsed = { 0 };
+  int capacity = list->capacity > 0 ? list->capacity : 64;
+  if (!table_init(&parsed, capacity, list->hash, list->cmp)) {
+    free(copy);
+    return false;
+  }
 
   char* name;
   char* cursor = copy;
   bool entry_found = false;
 
-  table_clear(list);
   while((name = strsep(&cursor, ","))) {
     if (strlen(name) > 0) {
-      _table_add(list, name, strlen(name) + 1, (void*)true);
+      if (!_table_add(&parsed, name, strlen(name) + 1, (void*)true)) {
+        table_free(&parsed);
+        free(copy);
+        return false;
+      }
       entry_found = true;
     }
   }
-  return entry_found;
+
+  struct table previous = *list;
+  *list = parsed;
+  table_free(&previous);
+  free(copy);
+  *enabled = entry_found;
+  return true;
 }
 
-static bool parse_color(struct color_style* style, char* token) {
-  if (sscanf(token, "=0x%x", &style->color) == 1) {
-    style->stype = COLOR_STYLE_SOLID;
+static int hex_digit_value(char digit) {
+  if (digit >= '0' && digit <= '9') return digit - '0';
+  if (digit >= 'a' && digit <= 'f') return digit - 'a' + 10;
+  if (digit >= 'A' && digit <= 'F') return digit - 'A' + 10;
+  return -1;
+}
+
+static void skip_inline_space(const char** cursor) {
+  while (**cursor == ' ' || **cursor == '\t') (*cursor)++;
+}
+
+static bool parse_hex_color(const char** cursor, uint32_t* color) {
+  if ((*cursor)[0] != '0' || (*cursor)[1] != 'x') return false;
+  *cursor += 2;
+
+  uint32_t value = 0;
+  int digits = 0;
+  int digit;
+  while ((digit = hex_digit_value(**cursor)) >= 0) {
+    if (digits == 8) return false;
+    value = (value << 4) | (uint32_t)digit;
+    digits++;
+    (*cursor)++;
+  }
+  if (!digits) return false;
+
+  *color = value;
+  return true;
+}
+
+static bool consume_literal(const char** cursor, const char* literal) {
+  size_t length = strlen(literal);
+  if (strncmp(*cursor, literal, length) != 0) return false;
+  *cursor += length;
+  return true;
+}
+
+static bool parse_gradient(struct color_style* style,
+                           const char* token,
+                           int direction,
+                           bool glow) {
+  const char* cursor = token;
+  const char* prefix = direction == TL_TO_BR
+                       ? (glow
+                          ? "=glow(gradient(top_left="
+                          : "=gradient(top_left=")
+                       : (glow
+                          ? "=glow(gradient(top_right="
+                          : "=gradient(top_right=");
+  const char* separator = direction == TL_TO_BR
+                          ? ",bottom_right="
+                          : ",bottom_left=";
+  const char* suffix = glow ? "))" : ")";
+
+  uint32_t color1 = 0;
+  uint32_t color2 = 0;
+  if (!consume_literal(&cursor, prefix)
+      || !parse_hex_color(&cursor, &color1)
+      || !consume_literal(&cursor, separator)
+      || !parse_hex_color(&cursor, &color2)
+      || strcmp(cursor, suffix) != 0) {
+    return false;
+  }
+
+  style->stype = COLOR_STYLE_GRADIENT;
+  style->glow = glow;
+  style->gradient.direction = direction;
+  style->gradient.color1 = color1;
+  style->gradient.color2 = color2;
+  return true;
+}
+
+static bool parse_color_list(uint32_t colors[BORDER_SIDE_COUNT],
+                             const char* token,
+                             char terminator,
+                             bool allow_per_edge) {
+  uint32_t parsed[BORDER_SIDE_COUNT] = {0};
+  int count = 0;
+  const char* cursor = token;
+
+  while (count < BORDER_SIDE_COUNT) {
+    skip_inline_space(&cursor);
+    if (!parse_hex_color(&cursor, &parsed[count])) return false;
+    count++;
+    skip_inline_space(&cursor);
+    if (*cursor != ',') break;
+    cursor++;
+  }
+
+  skip_inline_space(&cursor);
+  if (terminator) {
+    if (*cursor != terminator || cursor[1] != '\0') return false;
+  } else if (*cursor != '\0') {
+    return false;
+  }
+
+  if (!allow_per_edge && count != 1) return false;
+  if (count == 1) {
+    for (int side = 0; side < BORDER_SIDE_COUNT; side++) {
+      colors[side] = parsed[0];
+    }
+  } else if (count == 2) {
+    colors[BORDER_SIDE_TOP] = parsed[0];
+    colors[BORDER_SIDE_RIGHT] = 0;
+    colors[BORDER_SIDE_BOTTOM] = parsed[1];
+    colors[BORDER_SIDE_LEFT] = 0;
+  } else if (count == BORDER_SIDE_COUNT) {
+    memcpy(colors, parsed, sizeof(parsed));
+  } else {
+    return false;
+  }
+  return true;
+}
+
+static bool parse_solid(struct color_style* style,
+                        const char* token,
+                        bool glow,
+                        bool allow_per_edge) {
+  const char* prefix = glow ? "=glow(" : "=";
+  size_t prefix_length = strlen(prefix);
+  if (strncmp(token, prefix, prefix_length) != 0) return false;
+
+  uint32_t colors[BORDER_SIDE_COUNT];
+  if (!parse_color_list(colors,
+                        token + prefix_length,
+                        glow ? ')' : '\0',
+                        allow_per_edge)) {
+    return false;
+  }
+
+  style->stype = COLOR_STYLE_SOLID;
+  style->glow = glow;
+  memcpy(style->colors, colors, sizeof(colors));
+  return true;
+}
+
+static bool parse_color(struct color_style* style,
+                        const char* token,
+                        bool allow_per_edge) {
+  if (parse_gradient(style,
+                     token,
+                     TL_TO_BR,
+                     true)
+      || parse_gradient(style,
+                        token,
+                        TR_TO_BL,
+                        true)
+      || parse_gradient(style,
+                        token,
+                        TL_TO_BR,
+                        false)
+      || parse_gradient(style,
+                        token,
+                        TR_TO_BL,
+                        false)
+      || parse_solid(style, token, true, allow_per_edge)
+      || parse_solid(style, token, false, allow_per_edge)) {
     return true;
   }
-  else if (sscanf(token, "=glow(0x%x)", &style->color) == 1) {
-    style->stype = COLOR_STYLE_GLOW;
-    return true;
-  }
-  else if (sscanf(token,
-             "=gradient(top_left=0x%x,bottom_right=0x%x)",
-             &style->gradient.color1,
-             &style->gradient.color2) == 2) {
-    style->stype = COLOR_STYLE_GRADIENT;
-    style->gradient.direction = TL_TO_BR;
-    return true;
-  }
-  else if (sscanf(token,
-             "=gradient(top_right=0x%x,bottom_left=0x%x)",
-             &style->gradient.color1,
-             &style->gradient.color2) == 2) {
-    style->stype = COLOR_STYLE_GRADIENT;
-    style->gradient.direction = TR_TO_BL;
-    return true;
-  }
-  else printf("[?] Borders: Invalid color argument color%s\n", token);
+
+  printf("[?] Borders: Invalid color argument color%s\n", token);
 
   return false;
 }
 
-uint32_t parse_settings(struct settings* settings, int count, char** arguments) {
+static bool parse_border_style(const char* argument, char* style) {
+  static const struct {
+    const char* name;
+    char value;
+  } styles[] = {
+    { "round", BORDER_STYLE_ROUND },
+    { "r", BORDER_STYLE_ROUND },
+    { "uniform", BORDER_STYLE_ROUND_UNIFORM },
+    { "u", BORDER_STYLE_ROUND_UNIFORM },
+    { "square", BORDER_STYLE_SQUARE },
+    { "s", BORDER_STYLE_SQUARE },
+    { "none", BORDER_STYLE_NONE },
+    { "n", BORDER_STYLE_NONE }
+  };
+
+  if (strncmp(argument, "style=", 6) != 0) return false;
+  const char* value = argument + 6;
+  for (size_t i = 0; i < sizeof(styles) / sizeof(styles[0]); i++) {
+    if (strcmp(value, styles[i].name) == 0) {
+      *style = styles[i].value;
+      return true;
+    }
+  }
+  return false;
+}
+
+static uint32_t parse_settings_internal(struct settings* settings,
+                                        int count,
+                                        char** arguments,
+                                        bool global_controls) {
+  if (!settings || count <= 0 || !arguments) return 0;
   static char active_color[] = "active_color";
   static char inactive_color[] = "inactive_color";
   static char background_color[] = "background_color";
   static char blacklist[] = "blacklist=";
   static char whitelist[] = "whitelist=";
 
-  char order = 'a';
   uint32_t update_mask = 0;
   for (int i = 0; i < count; i++) {
+    if (!arguments[i]) continue;
+    bool active_only = settings->active_only;
     if (str_starts_with(arguments[i], active_color)) {
       if (parse_color(&settings->active_window,
-                                 arguments[i] + strlen(active_color))) {
+                      arguments[i] + strlen(active_color),
+                      true                                )) {
         update_mask |= BORDER_UPDATE_MASK_ACTIVE;
       }
     }
     else  if (str_starts_with(arguments[i], inactive_color)) {
       if (parse_color(&settings->inactive_window,
-                                 arguments[i] + strlen(inactive_color))) {
+                      arguments[i] + strlen(inactive_color),
+                      true                                  )) {
         update_mask |= BORDER_UPDATE_MASK_INACTIVE;
       }
     }
     else if (str_starts_with(arguments[i], background_color)) {
-      if (parse_color(&settings->background,
-                                 arguments[i] + strlen(background_color))) {
-        update_mask |= BORDER_UPDATE_MASK_ALL;
-        settings->show_background = settings->background.color & 0xff000000;
+      struct color_style bg;
+      if (parse_color(&bg,
+                      arguments[i] + strlen(background_color),
+                      false                                  )) {
+        if (bg.stype == COLOR_STYLE_GRADIENT) {
+          printf("[?] Borders: background_color does not support gradients\n");
+        } else {
+          settings->background = bg;
+          update_mask |= BORDER_UPDATE_MASK_ALL;
+          settings->show_background =
+              settings->background.colors[0] & 0xff000000;
+        }
       }
     }
     else if (str_starts_with(arguments[i], blacklist)) {
-      settings->blacklist_enabled = parse_list(&settings->blacklist,
-                                               arguments[i]
-                                               + strlen(blacklist));
-      update_mask |= BORDER_UPDATE_MASK_RECREATE_ALL;
+      if (global_controls) {
+        bool enabled = false;
+        if (parse_list(&g_blacklist,
+                       arguments[i] + strlen(blacklist),
+                       &enabled)) {
+          g_blacklist_enabled = enabled;
+          update_mask |= BORDER_UPDATE_MASK_RECREATE_ALL;
+        } else {
+          printf("[!] Borders: Failed to update blacklist\n");
+        }
+      }
     }
     else if (str_starts_with(arguments[i], whitelist)) {
-      settings->whitelist_enabled = parse_list(&settings->whitelist,
-                                               arguments[i]
-                                               + strlen(whitelist));
-      update_mask |= BORDER_UPDATE_MASK_RECREATE_ALL;
+      if (global_controls) {
+        bool enabled = false;
+        if (parse_list(&g_whitelist,
+                       arguments[i] + strlen(whitelist),
+                       &enabled)) {
+          g_whitelist_enabled = enabled;
+          update_mask |= BORDER_UPDATE_MASK_RECREATE_ALL;
+        } else {
+          printf("[!] Borders: Failed to update whitelist\n");
+        }
+      }
     }
-    else if (sscanf(arguments[i], "width=%f", &settings->border_width) == 1) {
+    else if (parse_width_argument(arguments[i], &settings->border_width)) {
       update_mask |= BORDER_UPDATE_MASK_ALL;
     }
-    else if (sscanf(arguments[i], "order=%c", &order) == 1) {
-      if (order == 'a') settings->border_order = BORDER_ORDER_ABOVE;
-      else settings->border_order = BORDER_ORDER_BELOW;
+    else if (parse_order_argument(arguments[i], &settings->border_order)) {
       update_mask |= BORDER_UPDATE_MASK_ALL;
     }
-    else if (sscanf(arguments[i], "style=%c", &settings->border_style) == 1) {
+    else if (str_starts_with(arguments[i], "style=")) {
+      char style;
+      if (parse_border_style(arguments[i], &style)) {
+        bool recreate = settings->border_style == BORDER_STYLE_NONE
+                        || style == BORDER_STYLE_NONE;
+        settings->border_style = style;
+        update_mask |= recreate
+                       ? BORDER_UPDATE_MASK_RECREATE_ALL
+                       : BORDER_UPDATE_MASK_ALL;
+      } else {
+        printf("[?] Borders: Invalid argument '%s'\n", arguments[i]);
+      }
+    }
+    else if (str_starts_with(arguments[i], "position=")
+             && border_position_parse(arguments[i] + strlen("position="),
+                                      &settings->border_position)) {
       update_mask |= BORDER_UPDATE_MASK_ALL;
     }
     else if (strcmp(arguments[i], "hidpi=on") == 0) {
@@ -126,12 +410,128 @@ uint32_t parse_settings(struct settings* settings, int count, char** arguments) 
       settings->ax_focus = false;
       update_mask |= BORDER_UPDATE_MASK_SETTING;
     }
-    else if (sscanf(arguments[i], "apply-to=%d", &settings->apply_to) == 1) {
-      update_mask |= BORDER_UPDATE_MASK_SETTING;
+    else if (active_only_parse_argument(arguments[i], &active_only)) {
+      if (global_controls) {
+        settings->active_only = active_only;
+        update_mask |= BORDER_UPDATE_MASK_RECREATE_ALL;
+      }
+    }
+    else if (strcmp(arguments[i], "adaptive_color=active") == 0) {
+      if (global_controls) {
+        settings->adaptive_color = ADAPTIVE_COLOR_MODE_ACTIVE;
+        update_mask |= BORDER_UPDATE_MASK_ADAPTIVE;
+      }
+    }
+    else if (strcmp(arguments[i], "adaptive_color=focus") == 0) {
+      if (global_controls) {
+        settings->adaptive_color = ADAPTIVE_COLOR_MODE_FOCUS;
+        update_mask |= BORDER_UPDATE_MASK_ADAPTIVE;
+      }
+    }
+    else if (strcmp(arguments[i], "adaptive_color=off") == 0) {
+      if (global_controls) {
+        settings->adaptive_color = ADAPTIVE_COLOR_MODE_OFF;
+        update_mask |= BORDER_UPDATE_MASK_ADAPTIVE;
+      }
+    }
+    else if (fade_argument_is_fade(arguments[i])) {
+      if (global_controls) {
+        if (fade_parse_argument(arguments[i], &settings->fade)
+            == FADE_ARGUMENT_VALID) {
+          update_mask |= BORDER_UPDATE_MASK_FADE;
+        } else {
+          printf("[?] Borders: Invalid argument '%s'\n", arguments[i]);
+        }
+      }
+    }
+    else if (str_starts_with(arguments[i], "apply-to=")) {
+      uint32_t apply_to = 0;
+      if (global_controls
+          && parse_u32_argument(arguments[i], "apply-to=", &apply_to)
+          && apply_to > 0) {
+        settings->apply_to = apply_to;
+        update_mask |= BORDER_UPDATE_MASK_SETTING;
+      } else if (global_controls) {
+        printf("[?] Borders: Invalid argument '%s'\n", arguments[i]);
+      }
     }
     else {
       printf("[?] Borders: Invalid argument '%s'\n", arguments[i]);
     }
   }
   return update_mask;
+}
+
+uint32_t parse_settings(struct settings* settings, int count, char** arguments) {
+  return parse_settings_internal(settings, count, arguments, true);
+}
+
+uint32_t parse_settings_override(struct settings* settings,
+                                 int count,
+                                 char** arguments) {
+  return parse_settings_internal(settings, count, arguments, false);
+}
+
+bool parse_settings_contains_global_filter(int count, char** arguments) {
+  static char blacklist[] = "blacklist=";
+  static char whitelist[] = "whitelist=";
+  if (count <= 0 || !arguments) return false;
+  for (int i = 0; i < count; ++i) {
+    if (str_starts_with(arguments[i], blacklist)
+        || str_starts_with(arguments[i], whitelist)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool parse_settings_contains_global_control(int count, char** arguments) {
+  if (parse_settings_contains_global_filter(count, arguments)) return true;
+  if (count <= 0 || !arguments) return false;
+
+  for (int i = 0; i < count; ++i) {
+    bool enabled = false;
+    if (active_only_parse_argument(arguments[i], &enabled)) return true;
+    if (arguments[i]
+        && str_starts_with(arguments[i], "adaptive_color=")) return true;
+    if (fade_argument_is_fade(arguments[i])) return true;
+  }
+  return false;
+}
+
+uint32_t parse_settings_apply_target(int count, char** arguments) {
+  uint32_t apply_to = 0;
+  if (count <= 0 || !arguments) return apply_to;
+  for (int i = 0; i < count; ++i) {
+    if (!arguments[i]) continue;
+    uint32_t candidate = 0;
+    if (parse_u32_argument(arguments[i], "apply-to=", &candidate)
+        && candidate > 0) {
+      apply_to = candidate;
+    }
+  }
+  return apply_to;
+}
+
+bool parse_settings_scope_is_valid(int count, char** arguments) {
+  if (count <= 0 || !arguments) return true;
+
+  bool apply_target_present = false;
+  for (int i = 0; i < count; ++i) {
+    if (!arguments[i]
+        || !str_starts_with(arguments[i], "apply-to=")) {
+      continue;
+    }
+
+    uint32_t target = 0;
+    if (apply_target_present
+        || !parse_u32_argument(arguments[i], "apply-to=", &target)
+        || target == 0) {
+      return false;
+    }
+    apply_target_present = true;
+  }
+
+  return !apply_target_present
+         || !parse_settings_contains_global_control(count, arguments);
 }

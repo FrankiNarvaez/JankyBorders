@@ -15,6 +15,10 @@ JankyBorders - A window border system for macOS
 .PP
 \fBborders [options]\fR
 .PP
+\fBborders --screen-capture-status\fR
+.PP
+\fBborders --request-screen-capture\fR
+.PP
 .SH DESCRIPTION
 .PP
 \fBJankyBorders\fR is a lightweight tool designed to add colored borders to
@@ -22,17 +26,60 @@ user windows on macOS 14.\&0+.\& It enhances the user experience by visually
 highlighting the currently focused window without relying on the accessibility
 API, thereby being faster than comparable tools.\&
 .PP
+The upstream project targets macOS 14.\&0 and newer.\& Changes in this fork are
+validated on macOS 26.\&5.\&2; earlier releases are outside this fork's current
+verification boundary.\&
+.PP
 .SH OPTIONS
 .PP
 \fBstyle=<style>\fR
 .RS 4
-Specifies the style of the border (either \fIround\fR or \fIsquare\fR)
+Specifies the style of the border (either \fIround\fR, \fIsquare\fR, \fIuniform\fR, or
+\fInone\fR)
+.PP
+.RE
+\fBposition=<position>\fR
+.RS 4
+Controls where the border is drawn relative to the window edge. \fIinside\fR
+draws entirely over the window, \fIcenter\fR straddles the edge, and \fIoutside\fR
+draws entirely beyond it. The default \fIauto\fR preserves the traditional
+appearance, but moves individual edges inside when they would be clipped by
+the display boundary.
 .PP
 .RE
 \fBactive_color=<color>\fR
 .RS 4
 Sets the border color for the focused window (format: \fI0xAARRGGBB\fR).\& For
 instance, active_color=0xff00ff00 creates a green border.\&
+.PP
+.RE
+\fBadaptive_color=<mode>\fR
+.RS 4
+Controls automatic contrast colors for the focused window.\& The default
+\fIoff\fR preserves \fIactive_color\fR.\& \fIactive\fR samples pixels just inside each
+window edge and independently selects pure black or pure white for each
+edge.\& \fIfocus\fR instead combines luminance from all usable edges and applies
+one color to the entire focused ring: \fI0xffe5484d\fR (#E5484D) when the window
+edge is bright overall, or \fI0xffe1e3e4\fR (#E1E3E4) when it is dark overall.\&
+The four edges never mix red and gray-white in \fIfocus\fR mode.\&
+Inactive windows continue to use \fIinactive_color\fR.\& A recommended local
+example is: borders
+adaptive_color=focus active_color=0xffe5484d width=5.\&0.\&
+.PP
+Both sampling modes require macOS screen-recording permission and are
+event-driven after focus, window creation or unhide, resize, and the final
+Space-recovery attempt.\& Scrolling and video playback alone do not trigger a
+new sample.\& In \fIfocus\fR mode, invalid edges are excluded and the remaining
+usable edges still produce one color for the whole ring.\& Once a consistent
+color exists, a partial-edge sample cannot replace it; a different color must
+be confirmed by two complete successful samples.\& If no edge is usable or a
+capture or analysis temporarily fails, the ring keeps its previous consistent
+color until a later successful sample.\& Before the first successful sample, the
+entire ring falls back uniformly to \fIactive_color\fR.\&
+Losing screen-recording permission still disables sampling and returns to that
+fallback.\& It uses the first color from a multi-edge
+\fIactive_color\fR, or the midpoint of a gradient.\& This process-wide setting
+cannot be combined with \fIapply-to=<window-id>\fR.\&
 .PP
 .RE
 \fBinactive_color=<color>\fR
@@ -56,6 +103,41 @@ Determines the width of the border.\& For example, width=5.\&0 creates a border
 If set to \fIon\fR, the border will be drawn with retina resolution.\&
 .PP
 .RE
+\fBactive_only=<boolean>\fR
+.RS 4
+If set to \fIon\fR, only the focused window receives a border.\& This reduces
+the number of backing surfaces kept alive and can lower memory usage.\&
+Since inactive borders are not kept alive in this mode, \fIinactive_color\fR
+has no visible effect.\& The setting can be changed at runtime.\&
+.PP
+.RE
+\fBfade=<boolean>\fR
+.RS 4
+If set to \fIon\fR, the focused border fades out after \fIfade_delay\fR seconds
+and stays hidden until the focus changes.\& The default is \fIoff\fR, which
+keeps the border permanently visible.\& Only the focused border fades;
+inactive borders keep their normal appearance, and moving, resizing or
+switching Spaces does not show a faded border again.\& To hide inactive
+borders as well, combine it with \fIactive_only=on\fR or a transparent
+\fIinactive_color\fR.\& This process-wide setting can be changed at runtime and
+cannot be combined with \fIapply-to=<window-id>\fR.\&
+.PP
+.RE
+\fBfade_delay=<seconds>\fR
+.RS 4
+How long the focused border stays fully visible before it starts to
+fade (default 2.\&0).\& Must be greater than 0 and at most 3600.\& Only used
+with \fIfade=on\fR.\& This process-wide setting cannot be combined with
+\fIapply-to=<window-id>\fR.\&
+.PP
+.RE
+\fBfade_duration=<milliseconds>\fR
+.RS 4
+How long the fade itself takes (default 300).\& Must be between 0 and 10000;
+0 hides the border at once after the delay.\& Only used with \fIfade=on\fR.\& This
+process-wide setting cannot be combined with \fIapply-to=<window-id>\fR.\&
+.PP
+.RE
 \fBax_focus=<boolean>\fR
 .RS 4
 If set to \fIon\fR, the (slower) accessibility API is used to resolve the
@@ -77,12 +159,31 @@ Once this list is populated, only applications listed here are considered
 for receiving a border.\& If the whitelist is empty (default) it is inactive.\&
 .PP
 .RE
+\fB--screen-capture-status\fR
+.RS 4
+Prints whether screen-recording permission is granted.\& This utility exits
+without starting a border instance or requesting Accessibility permission.\&
+.PP
+.RE
+\fB--request-screen-capture\fR
+.RS 4
+Explicitly asks macOS for the screen-recording permission used by
+\fIadaptive_color=active\fR and \fIadaptive_color=focus\fR.\& This utility exits
+without starting a border instance or requesting Accessibility permission.\&
+After granting access in System Settings, restart a running local service with
+\fImake service-restart\fR.\& The LaunchAgent never invokes this option at login.\&
+When using the Make target, install the signed app first; the target launches
+the app through LaunchServices so permission is attached to the service
+identity.\&
+.PP
+.RE
 If an instance of \fBborders\fR is already running, subsequent invocations will
 update the existing process with the new arguments.\&
 .PP
 If no instance of \fBborders\fR is running and no arguments are supplied, we try
-to execute a file at ~/.\&config/borders/bordersrc where a configuration command
-could be issued.\&
+to execute the first configuration file found at
+$XDG_CONFIG_HOME/borders/bordersrc (when XDG_CONFIG_HOME is absolute),
+$HOME/.\&config/borders/bordersrc, or the legacy $HOME/.\&bordersrc path.\&
 .PP
 .SH NOMENCLATURE
 .PP
@@ -96,9 +197,22 @@ A floating point number.\&
 Either \fIon\fR or \fIoff\fR.\&
 .PP
 .RE
+\fB<mode>\fR
+.RS 4
+For \fIadaptive_color\fR, either \fIoff\fR (the default), \fIactive\fR, or
+\fIfocus\fR.\&
+.PP
+.RE
 \fB<style>\fR
 .RS 4
-Either \fIround\fR, \fIsquare\fR, or \fIuniform\fR.\&
+Either \fIround\fR, \fIsquare\fR, \fIuniform\fR, or \fInone\fR.\& The \fInone\fR style disables
+borders without stopping the running process, so a later style update can
+enable them again.\&
+.PP
+.RE
+\fB<position>\fR
+.RS 4
+Either \fIauto\fR, \fIinside\fR, \fIcenter\fR, or \fIoutside\fR.
 .PP
 .RE
 \fB<color>\fR
@@ -107,15 +221,29 @@ A color formatted as \fI0xAARRGGBB\fR, where \fIA\fR is the alpha channel, \fIR\
 red channel, \fIG\fR the green channel and \fIB\fR the blue channel.\& All
 constituents take a base 16 number, i.\&e.\& \fI0-F\fR.\&
 .PP
-The color argument can take the special values: 
+For active and inactive borders, a comma-separated list can color each
+edge independently: one color applies to every edge, two colors apply to
+the top and bottom edges (the other edges are hidden), and four colors
+apply to the top, right, bottom, and left edges.\& Adjacent colors meet at
+45-degree corners.\& Per-edge colors can also be wrapped in \fIglow(.\&.\&.)\fR.\&
+Background colors remain single-color only.\&
+.PP
+The color argument can take the special values:
 .br
-	\fIgradient(top_left=0xAARRGGBB,bottom_right=0xAARRGGBB)\fR 
+	\fIgradient(top_left=0xAARRGGBB,bottom_right=0xAARRGGBB)\fR
 .br
-	\fIgradient(top_right=0xAARRGGBB,bottom_left=0xAARRGGBB)\fR 
+	\fIgradient(top_right=0xAARRGGBB,bottom_left=0xAARRGGBB)\fR
 .br
-	\fIglow(0xAARRGGBB)\fR 
+	\fIglow(0xAARRGGBB[,0xAARRGGBB...])\fR
+.br
+	\fIglow(gradient(top_left=0xAARRGGBB,bottom_right=0xAARRGGBB))\fR
+.br
+	\fIglow(gradient(top_right=0xAARRGGBB,bottom_left=0xAARRGGBB))\fR
 .br
 (You might need to quote these arguments depending on your shell)
+.PP
+The glow color for a gradient is the alpha-weighted blend of its two
+endpoint colors.\&
 .PP
 .RE
 \fB<application_list>\fR
@@ -124,6 +252,44 @@ A comma separated list of application names.\& This argument should be
 quoted.\&
 .PP
 .RE
+.SH LOCAL SERVICE
+.PP
+When building this fork from its source checkout, \fImake install-service\fR
+performs the complete first-time setup.\& It automatically creates a stable,
+local-only code-signing identity in the login keychain.\& macOS may prompt you
+to unlock the keychain and approve a user-level trust setting limited to code
+signing; the Keychain Access certificate wizard is not required.\&
+.PP
+Use \fImake setup-signing\fR to prepare the identity without installing the
+service.\& \fImake signing-help\fR documents the optional manual path, and
+\fImake signing-status\fR validates the result.\& Automatic setup never changes
+system/admin trust, never grants every application private-key access, never
+writes the generated private key to a regular file, and refuses to overwrite
+an existing item with the same name.\&
+.PP
+The installer packages a versioned \fIJankyBorders.app\fR.\& The stable
+application identity is intended to preserve macOS screen-recording permission
+across compatible updates and rollbacks.\& It is not a Developer ID and is not
+suitable for distribution to other Macs.\&
+.PP
+Manage the per-user LaunchAgent with:
+.PP
+	\fImake install-service\fR
+.br
+	\fImake update-service\fR
+.br
+	\fImake rollback-service\fR
+.br
+	\fImake service-status\fR
+.br
+	\fImake service-start\fR
+.br
+	\fImake service-stop\fR
+.br
+	\fImake service-restart\fR
+.br
+	\fImake uninstall-service\fR
+.PP
 .SH BUGS
 .PP
 Report them at https://github.\&com/FelixKratz/JankyBorders/issues.\&

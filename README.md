@@ -7,12 +7,92 @@ user windows on macOS 14.0+. It enhances the user experience by visually
 highlighting the currently focused window without relying on the accessibility
 API, thereby being faster than comparable tools.
 
+The upstream project targets macOS 14.0 and newer. Changes in this fork are
+validated on macOS 26.5.2; earlier releases are outside this fork's current
+verification boundary.
+
 ## Usage
 ### Install
 The binary can be made available by installing it through Homebrew:
 ```bash
 brew tap FelixKratz/formulae
 brew install borders
+```
+
+#### Install this fork as a user service
+
+The local service is packaged as a versioned `JankyBorders.app`. To install the
+current checkout instead of the upstream Homebrew build, use:
+
+```bash
+make install-service
+```
+
+If the installer reports that the Homebrew service is running, stop it once
+with `brew services stop borders`, then run `make install-service` again.
+
+On the first installation, this automatically creates one stable,
+local-only code-signing identity in your login keychain. macOS may prompt you
+to unlock the keychain and approve a user-level trust setting limited to code
+signing; no Keychain Access wizard is required. The identity lets macOS
+associate screen-recording permission with the same application across updates
+and rollbacks. It is not a Developer ID and is not suitable for distributing
+the app to other Macs.
+
+Run `make setup-signing` if you want to prepare the identity without installing
+the service. `make signing-help` documents the optional manual path. Automatic
+setup never changes system/admin trust, never grants every application private
+key access, never writes the generated private key to a regular file, and
+refuses to overwrite an existing item with the same name.
+
+This builds the current source, installs the signed and versioned app below
+`$HOME/.local/opt/jankyborders`, updates `$HOME/.local/bin/borders`, and starts
+the user LaunchAgent `io.github.qeesung.jankyborders.local`. It does not modify
+the Homebrew Cellar, so the Homebrew build remains available as a rollback.
+
+The service starts `borders` without arguments so that the normal
+`bordersrc` lookup described below still applies. Its `PATH` puts
+`$HOME/.local/bin` first, which also ensures that a `borders` command inside
+the configuration file talks to this fork.
+
+Use exactly one primary startup mechanism. While this LaunchAgent is installed,
+do not also start `borders` from `yabairc`, `aerospace.toml`, or
+`brew services`; competing instances share the same command port and can make
+the service restart repeatedly. Put appearance options in `bordersrc` instead.
+
+After pulling or changing the source, rebuild and atomically switch the local
+installation with:
+
+```bash
+make update-service
+```
+
+Service lifecycle commands are:
+
+```bash
+make service-status
+make service-stop
+make service-start
+make service-restart
+make rollback-service
+make uninstall-service
+```
+
+`rollback-service` swaps the `current` and `previous` version links and restarts
+the service when a compatible previous service installation exists. A first
+install or migration from an older local layout may not have a rollback target
+until the next successful update. `service-stop` disables the LaunchAgent until
+`service-start` or a new install, including across login sessions.
+
+`uninstall-service` removes the LaunchAgent and the managed command/man-page
+links but preserves versioned files under `$HOME/.local/opt/jankyborders` for
+manual inspection. Logs are written to `$HOME/Library/Logs/JankyBorders`. To
+return to the Homebrew service, run:
+
+```bash
+make uninstall-service
+hash -r
+brew services start borders
 ```
 
 For a comprehensive overview of all available options and commands, consult the
@@ -34,7 +114,7 @@ after-startup-command = [
   'exec-and-forget borders active_color=0xffe1e3e4 inactive_color=0xff494d64 width=5.0'
 ]
 ```
-to you `aerospace.toml`. This will start borders with the specified options
+to your `aerospace.toml`. This will start borders with the specified options
 along with AeroSpace.
 
 ### Bootstrap with brew
@@ -50,11 +130,19 @@ The appearance can be adapted at any point in time.
 
 #### Using a configuration file (Optional)
 If the primary `borders` process is started without any arguments (or launched
-as a service by brew), it will search for a file at
-`~/.config/borders/bordersrc` and execute it on launch if found.
+as a service by brew), it searches for and executes the first existing file in
+this order:
 
-An example configuration file could look like this:
-`~/.config/borders/bordersrc`
+1. `$XDG_CONFIG_HOME/borders/bordersrc` when `XDG_CONFIG_HOME` is absolute
+2. `$HOME/.config/borders/bordersrc`
+3. `$HOME/.bordersrc` (legacy fallback)
+
+A relative `XDG_CONFIG_HOME` is ignored, as required by the XDG Base Directory
+specification.
+
+An example configuration file could be placed at
+`$HOME/.config/borders/bordersrc`. If `XDG_CONFIG_HOME` is set, it must be an
+absolute path; place the file at `$XDG_CONFIG_HOME/borders/bordersrc`.
 ```bash
 #!/bin/bash
 
@@ -62,11 +150,77 @@ options=(
 	style=round
 	width=6.0
 	hidpi=off
+	active_only=off
+	adaptive_color=off
 	active_color=0xffe2e2e3
 	inactive_color=0xff414550
 )
 
 borders "${options[@]}"
+```
+
+#### Fading the focused border
+
+Fading is disabled by default. With `fade=on`, the focused border stays fully
+visible for `fade_delay` seconds (default `2.0`, greater than 0 and at most
+3600), then fades out over `fade_duration` milliseconds (default `300`, from 0
+to 10000; `0` hides it at once). Only the focused border fades, and it
+reappears only when the focus changes, not on move, resize or Space switch.
+To hide inactive borders as well, combine it with `active_only=on` or a
+transparent `inactive_color`.
+
+```bash
+borders active_only=on fade=on fade_delay=1.5 fade_duration=400
+```
+
+`fade`, `fade_delay` and `fade_duration` are process-wide settings, can be
+changed at runtime, and cannot be combined with `apply-to=<window-id>`.
+
+#### Adapting the focused border to window-edge colors
+
+Adaptive color is disabled by default. It provides two process-wide sampling
+modes. `active` keeps the high-contrast behavior and independently chooses
+pure black or pure white for each edge. `focus` combines the luminance from all
+usable edges and applies one color to the entire focused ring: `0xffe5484d`
+(#E5484D) when the window edge is bright overall, or `0xffe1e3e4` (#E1E3E4)
+when it is dark overall. The four edges never mix red and gray-white in
+`focus` mode. Inactive borders continue to use `inactive_color`.
+
+For a comfortable local focus ring, use:
+
+```bash
+borders adaptive_color=focus active_color=0xffe5484d width=5.0
+```
+
+`adaptive_color` is a process-wide setting and cannot be combined with
+`apply-to=<window-id>`.
+
+Both sampling modes are event-driven: they run after focus, window creation or
+unhide, resize, and the final Space-recovery attempt. They intentionally do not
+capture continuously, so scrolling and video playback alone do not update the
+border. In `focus` mode, invalid edges are excluded and the remaining usable
+edges still produce one color for the whole ring. Once a consistent color has
+been established, a partial-edge sample cannot replace it; a different color
+must be confirmed by two complete successful samples. If no edge is usable or
+a capture or analysis temporarily fails, the ring keeps its previous consistent
+color until a later successful sample. Before the first successful sample, the
+entire ring falls back uniformly to `active_color`. A
+multi-edge `active_color` uses its first color for this fallback; a gradient uses
+its midpoint color. Losing screen-recording permission still disables sampling
+and returns to the configured fallback.
+
+Both sampling modes require macOS screen-recording permission. The user service
+never opens the permission prompt at login. Check or request permission
+explicitly after `make install-service`, then restart the service after
+granting it in System Settings. These Make targets deliberately execute the
+installed, stably signed app through LaunchServices rather than running the
+unsigned build output, so the permission belongs to the same identity used by
+the LaunchAgent:
+
+```bash
+make screen-capture-status
+make request-screen-capture
+make service-restart
 ```
 
 #### Updating the border properties during runtime

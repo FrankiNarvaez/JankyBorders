@@ -1,7 +1,13 @@
 #pragma once
 #include "extern.h"
+#include "config.h"
 #include "sys/stat.h"
+#include <limits.h>
 #include "ApplicationServices/ApplicationServices.h"
+#include <errno.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <unistd.h>
 
 #define DELAY_ASYNC_EXEC_ON_MAIN_THREAD(delay, code) {\
   dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{\
@@ -18,6 +24,8 @@ static inline void debug(const char* message, ...) {
   va_start(va, message);
   vprintf(message, va);
   va_end(va);
+#else
+  (void)message;
 #endif
 }
 
@@ -47,18 +55,16 @@ static inline bool file_setx(const char* filename) {
 }
 
 static inline void execute_config_file(const char* name, const char* filename) {
-  char *home = getenv("HOME");
-  if (!home) return;
-
-  uint32_t size = strlen(home) + strlen(name) + strlen(filename) + 256;
-  char path[size];
-  snprintf(path, size, "%s/.config/%s/%s", home, name, filename);
-  if (!file_exists(path)) {
-    snprintf(path, size, "%s/.%s", home, filename);
-    if (!file_exists(path)) {
-      debug("No config file found...\n");
-      return;
-    };
+  char path[PATH_MAX];
+  if (!config_resolve_path(path,
+                           sizeof(path),
+                           name,
+                           filename,
+                           getenv("XDG_CONFIG_HOME"),
+                           getenv("HOME"),
+                           file_exists                )) {
+    debug("No config file found...\n");
+    return;
   }
 
   if (!file_setx(path)) {
@@ -73,15 +79,43 @@ static inline void execute_config_file(const char* name, const char* filename) {
   if (pid !=  0) return;
 
   alarm(60);
-  char* exec[] = { "/usr/bin/env", "sh", "-c", path, NULL };
-  exit(execvp(exec[0], exec));
+  char* direct_arguments[] = { path, NULL };
+  execv(path, direct_arguments);
+
+  // Preserve support for legacy config files without a shebang. Passing the
+  // path as an argument keeps spaces and shell metacharacters literal.
+  if (errno == ENOEXEC) {
+    char* shell_arguments[] = { "/bin/sh", path, NULL };
+    execv(shell_arguments[0], shell_arguments);
+  }
+  _exit(126);
 }
 
-static inline  CFArrayRef cfarray_of_cfnumbers(void* values, size_t size, int count, CFNumberType type) {
-  CFNumberRef temp[count];
+static inline CFArrayRef cfarray_of_cfnumbers(const void* values,
+                                              size_t size,
+                                              int count,
+                                              CFNumberType type) {
+  if (count < 0) return NULL;
+  if (count == 0) {
+    return CFArrayCreate(NULL, NULL, 0, &kCFTypeArrayCallBacks);
+  }
+  if (!values || size == 0
+      || (size_t)count > SIZE_MAX / sizeof(CFNumberRef)
+      || (size_t)count > SIZE_MAX / size) {
+    return NULL;
+  }
 
+  CFNumberRef* temp = calloc((size_t)count, sizeof(CFNumberRef));
+  if (!temp) return NULL;
   for (int i = 0; i < count; ++i) {
-    temp[i] = CFNumberCreate(NULL, type, ((char *)values) + (size * i));
+    temp[i] = CFNumberCreate(NULL,
+                             type,
+                             ((const char*)values) + (size * (size_t)i));
+    if (!temp[i]) {
+      for (int j = 0; j < i; ++j) CFRelease(temp[j]);
+      free(temp);
+      return NULL;
+    }
   }
 
   CFArrayRef result = CFArrayCreate(NULL,
@@ -90,6 +124,7 @@ static inline  CFArrayRef cfarray_of_cfnumbers(void* values, size_t size, int co
                                     &kCFTypeArrayCallBacks);
 
   for (int i = 0; i < count; ++i) CFRelease(temp[i]);
+  free(temp);
 
   return result;
 }

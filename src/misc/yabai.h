@@ -7,12 +7,13 @@
 #include "../windows.h"
 #include "../mach.h"
 #include <CoreVideo/CoreVideo.h>
+#include <math.h>
 #include <pthread.h>
 
 // Additional border interfaces needed for the yabai integration
-void border_init(struct border* border, int cid);
+bool border_init(struct border* border, int cid);
 void border_create_window(struct border* border, CGRect frame, bool unmanaged, bool hidpi);
-void border_update_internal(struct border* border, struct settings* settings);
+bool border_update_internal(struct border* border, struct settings* settings);
 
 struct track_transform_payload {
   int cid;
@@ -22,15 +23,17 @@ struct track_transform_payload {
   CGAffineTransform initial_transform;
 };
 
-struct yabai_proxy_payload {
-  union { struct border* proxy; struct border* border; };
-  struct settings settings;
-  uint32_t border_wid;
-  uint32_t real_wid;
-  uint32_t external_proxy_wid;
-};
-
-static CVReturn track_transform(CVDisplayLinkRef display_link, const CVTimeStamp* now, const CVTimeStamp* output_time, CVOptionFlags flags, CVOptionFlags* flags_out, void* context) {
+static CVReturn track_transform(CVDisplayLinkRef display_link,
+                                const CVTimeStamp* now,
+                                const CVTimeStamp* output_time,
+                                CVOptionFlags flags,
+                                CVOptionFlags* flags_out,
+                                void* context) {
+  (void)display_link;
+  (void)now;
+  (void)output_time;
+  (void)flags;
+  (void)flags_out;
   struct animation* animation = context;
   usleep(0.25*animation->frame_time);
 
@@ -55,175 +58,299 @@ static CVReturn track_transform(CVDisplayLinkRef display_link, const CVTimeStamp
   return kCVReturnSuccess;
 }
 
-static void* yabai_proxy_begin_proc(void* context) {
-  struct yabai_proxy_payload* info = context;
-  struct border* proxy = info->proxy;
+static struct border* yabai_proxy_create_candidate(struct border* border) {
+  struct border* proxy = malloc(sizeof(struct border));
+  if (!proxy) return NULL;
+  if (!border_init(proxy, border->cid)) {
+    free(proxy);
+    return NULL;
+  }
+
+  // Proxy borders share their parent's SkyLight connection. Mark ownership
+  // before any fallible helper-window operation so failure cleanup never
+  // releases the parent's connection.
+  proxy->is_proxy = true;
+  proxy->target_wid = border->target_wid;
+  proxy->sid = border->sid;
+  border_create_window(proxy, CGRectNull, true, false);
+  if (!proxy->wid || !proxy->context) {
+    border_destroy(proxy);
+    return NULL;
+  }
+
+  // border_create_window records its creation frame. Restore the parent's
+  // geometry afterwards because it seeds the transform-tracking payload.
+  proxy->target_bounds = border->target_bounds;
+  proxy->frame = border->frame;
+  proxy->focused = border->focused;
+  proxy->radius = border->radius;
+  proxy->inner_radius = border->inner_radius;
+  window_send_to_space(proxy->cid, proxy->wid, proxy->sid);
+  return proxy;
+}
+
+static bool yabai_restore_parent_alpha(struct border* border) {
+  // This is a single-window restore, so use the direct API whose CGError is
+  // meaningful. The transaction variant leaves an unspecified return value in
+  // the register on macOS 26 and cannot be used as a success predicate.
+  // A faded focused border must stay faded; fade_alpha is 1 when inactive.
+  float alpha = border->fade_alpha;
+  CGError error = SLSSetWindowAlpha(border->cid, border->wid, alpha);
+  if (error == kCGErrorSuccess) border->fade_alpha_wid = border->wid;
+  return error == kCGErrorSuccess;
+}
+
+static void yabai_retry_parent_alpha(struct table* windows,
+                                     uint32_t real_wid,
+                                     unsigned int attempt) {
+  if (attempt >= 3) return;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                               (int64_t)(attempt + 1)
+                                 * 100 * NSEC_PER_MSEC),
+                 dispatch_get_main_queue(),
+                 ^{
+    uint32_t target_wid = real_wid;
+    struct border* border = table_find(windows, &target_wid);
+    if (!border) return;
+
+    pthread_mutex_lock(&border->mutex);
+    if (border->proxy || border->external_proxy_wid) {
+      pthread_mutex_unlock(&border->mutex);
+      return;
+    }
+    bool restored = yabai_restore_parent_alpha(border);
+    if (restored) {
+      struct settings settings = *border_get_settings(border);
+      border_update_internal(border, &settings);
+    }
+    pthread_mutex_unlock(&border->mutex);
+    if (!restored) {
+      yabai_retry_parent_alpha(windows, real_wid, attempt + 1);
+    }
+  });
+}
+
+static bool yabai_proxy_activate(struct border* border,
+                                 struct border* proxy,
+                                 uint32_t external_proxy_wid,
+                                 struct settings* settings) {
   pthread_mutex_lock(&proxy->mutex);
 
-  struct track_transform_payload* payload
-                            = malloc(sizeof(struct track_transform_payload));
+  CGRect proxy_frame = CGRectNull;
+  if (SLSGetWindowBounds(proxy->cid,
+                         external_proxy_wid,
+                         &proxy_frame) != kCGErrorSuccess
+      || !isfinite(proxy_frame.size.width)
+      || !isfinite(proxy_frame.size.height)
+      || proxy_frame.size.width <= 0.0
+      || proxy_frame.size.height <= 0.0) {
+    pthread_mutex_unlock(&proxy->mutex);
+    return false;
+  }
 
-  CGRect proxy_frame;
-  SLSGetWindowBounds(proxy->cid, info->external_proxy_wid, &proxy_frame);
+  struct track_transform_payload* payload = malloc(sizeof(*payload));
+  if (!payload) {
+    pthread_mutex_unlock(&proxy->mutex);
+    return false;
+  }
 
   payload->proxy_wid = proxy->wid;
-  payload->border_wid = info->border_wid;
-  payload->target_wid = info->external_proxy_wid;
+  payload->border_wid = border->wid;
+  payload->target_wid = external_proxy_wid;
   payload->cid = proxy->cid;
-
   payload->initial_transform = CGAffineTransformIdentity;
   payload->initial_transform.a = proxy->target_bounds.size.width
                                 / proxy_frame.size.width;
   payload->initial_transform.d = proxy->target_bounds.size.height
                                 / proxy_frame.size.height;
-  payload->initial_transform.tx = 0.5*(proxy->frame.size.width
-                                 - proxy->target_bounds.size.width);
-  payload->initial_transform.ty = 0.5*(proxy->frame.size.height
-                                 - proxy->target_bounds.size.height);
+  payload->initial_transform.tx = 0.5 * (proxy->frame.size.width
+                                  - proxy->target_bounds.size.width);
+  payload->initial_transform.ty = 0.5 * (proxy->frame.size.height
+                                  - proxy->target_bounds.size.height);
 
   animation_stop(&proxy->animation);
-  animation_start(&proxy->animation, track_transform, payload);
+  if (!animation_start(&proxy->animation, track_transform, payload)) {
+    pthread_mutex_unlock(&proxy->mutex);
+    return false;
+  }
 
-  if (!proxy->is_proxy) {
-    proxy->is_proxy = true;
-    proxy->frame = CGRectNull;
-    border_update_internal(proxy, &info->settings);
+  proxy->frame = CGRectNull;
+  if (!border_update_internal(proxy, settings)) {
+    animation_stop(&proxy->animation);
+    pthread_mutex_unlock(&proxy->mutex);
+    return false;
   }
 
   CFTypeRef transaction = SLSTransactionCreate(proxy->cid);
-  if (transaction) {
-    SLSTransactionOrderWindow(transaction,
-                              proxy->wid,
-                              info->settings.border_order,
-                              info->external_proxy_wid    );
-
-    SLSTransactionSetWindowAlpha(transaction, info->border_wid, 0.f);
-    SLSTransactionSetWindowAlpha(transaction, proxy->wid, 1.f);
-    SLSTransactionCommit(transaction, 0);
-    CFRelease(transaction);
+  if (!transaction) {
+    animation_stop(&proxy->animation);
+    pthread_mutex_unlock(&proxy->mutex);
+    return false;
   }
+  SLSTransactionOrderWindow(transaction,
+                            proxy->wid,
+                            proxy->effective_order,
+                            external_proxy_wid);
+  SLSTransactionSetWindowAlpha(transaction, border->wid, 0.f);
+  // The proxy stands in for the border during the animation, so it inherits
+  // the fade state: a faded focused border must not flash back.
+  SLSTransactionSetWindowAlpha(transaction, proxy->wid, border->fade_alpha);
+  SLSTransactionCommit(transaction, 0);
+  CFRelease(transaction);
 
   pthread_mutex_unlock(&proxy->mutex);
-  free(context);
-  return NULL;
+  return true;
 }
 
-static void* yabai_proxy_end_proc(void* context) {
-  struct yabai_proxy_payload* info = context;
-  struct border* border = info->border;
+static void yabai_proxy_begin_on_main(struct table* windows,
+                                      uint32_t wid,
+                                      uint32_t real_wid) {
+  struct border* border = table_find(windows, &real_wid);
+  if (!border) return;
+
   pthread_mutex_lock(&border->mutex);
-  border->event_buffer.disable_coalescing = true;
+  if (!border->wid || !border->context) {
+    pthread_mutex_unlock(&border->mutex);
+    return;
+  }
+  struct settings settings = *border_get_settings(border);
+  struct border* previous_proxy = border->proxy;
+  struct border* candidate = yabai_proxy_create_candidate(border);
+  bool restore_failed = false;
+  if (!candidate
+      || !yabai_proxy_activate(border, candidate, wid, &settings)) {
+    if (!previous_proxy) {
+      border->external_proxy_wid = 0;
+      restore_failed = !yabai_restore_parent_alpha(border);
+      border_update_internal(border, &settings);
+    }
+    pthread_mutex_unlock(&border->mutex);
+    if (candidate) border_destroy(candidate);
+    if (restore_failed) yabai_retry_parent_alpha(windows, real_wid, 0);
+    return;
+  }
+
+  border->proxy = candidate;
+  border->external_proxy_wid = wid;
+  if (previous_proxy) {
+    pthread_mutex_lock(&previous_proxy->mutex);
+    animation_stop(&previous_proxy->animation);
+    pthread_mutex_unlock(&previous_proxy->mutex);
+    border_destroy(previous_proxy);
+  }
+  pthread_mutex_unlock(&border->mutex);
+}
+
+static inline void yabai_proxy_begin(struct table* windows,
+                                     uint32_t wid,
+                                     uint32_t real_wid) {
+  if (!windows || !real_wid || !wid) return;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    yabai_proxy_begin_on_main(windows, wid, real_wid);
+  });
+}
+
+static void yabai_proxy_end_on_main(struct table* windows,
+                                    uint32_t wid,
+                                    uint32_t real_wid,
+                                    unsigned int attempt) {
+  struct border* border = table_find(windows, &real_wid);
+  if (!border) return;
+
+  pthread_mutex_lock(&border->mutex);
+  if (!border->proxy || border->external_proxy_wid != wid) {
+    pthread_mutex_unlock(&border->mutex);
+    return;
+  }
+
+  struct border* proxy = border->proxy;
+  if (!yabai_restore_parent_alpha(border)) {
+    pthread_mutex_unlock(&border->mutex);
+    if (attempt < 2) {
+      dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                   (int64_t)(attempt + 1)
+                                     * 100 * NSEC_PER_MSEC),
+                     dispatch_get_main_queue(),
+                     ^{
+        yabai_proxy_end_on_main(windows, wid, real_wid, attempt + 1);
+      });
+    }
+    return;
+  }
+  border->proxy = NULL;
   border->external_proxy_wid = 0;
-  border_update_internal(border, &info->settings);
+
+  pthread_mutex_lock(&proxy->mutex);
+  animation_stop(&proxy->animation);
+  SLSSetWindowAlpha(border->cid, proxy->wid, 0.f);
+  pthread_mutex_unlock(&proxy->mutex);
+
+  struct settings settings = *border_get_settings(border);
+  border->event_buffer.disable_coalescing = true;
+  border_update_internal(border, &settings);
   border->event_buffer.disable_coalescing = false;
   pthread_mutex_unlock(&border->mutex);
-  free(context);
-  return NULL;
+  border_destroy(proxy);
 }
 
-static inline void yabai_proxy_begin(struct table* windows, uint32_t wid, uint32_t real_wid) {
-  if (!real_wid || !wid) return;
-  struct border* border = table_find(windows, &real_wid);
-
-  if (border) {
-    pthread_mutex_lock(&border->mutex);
-    border->external_proxy_wid = wid;
-    if (!border->proxy) {
-      border->proxy = malloc(sizeof(struct border));
-      border_init(border->proxy, border->cid);
-      border_create_window(border->proxy, CGRectNull, true, false);
-      border->proxy->target_bounds = border->target_bounds;
-      border->proxy->frame = border->frame;
-      border->proxy->focused = border->focused;
-      border->proxy->target_wid = border->target_wid;
-      border->proxy->sid = border->sid;
-      border->proxy->radius = border->radius;
-      border->proxy->inner_radius = border->inner_radius;
-    }
-
-    struct yabai_proxy_payload* payload
-                            = malloc(sizeof(struct yabai_proxy_payload));
-    payload->proxy = border->proxy;
-    payload->border_wid = border->wid;
-    payload->external_proxy_wid = border->external_proxy_wid;
-    payload->real_wid = real_wid;
-    payload->settings = *border_get_settings(border);
-
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-      yabai_proxy_begin_proc(payload);
-    });
-    pthread_mutex_unlock(&border->mutex);
-  }
-}
-
-static inline void yabai_proxy_end(struct table* windows, uint32_t wid, uint32_t real_wid) {
-  if (!real_wid || !wid) return;
-  struct border* border = (struct border*)table_find(windows, &real_wid);
-  if (border) pthread_mutex_lock(&border->mutex);
-  if (border && border->proxy && border->external_proxy_wid == wid) {
-    struct border* proxy = border->proxy;
-    border->proxy = NULL;
-
-    CFTypeRef transaction = SLSTransactionCreate(border->cid);
-    if (transaction) {
-      SLSTransactionSetWindowAlpha(transaction, proxy->wid, 0.f);
-      SLSTransactionSetWindowAlpha(transaction, border->wid, 1.f);
-      SLSTransactionCommit(transaction, 0);
-      CFRelease(transaction);
-    }
-
-    animation_stop(&proxy->animation);
-    border_destroy(proxy);
-
-    struct yabai_proxy_payload* payload
-                                  = malloc(sizeof(struct yabai_proxy_payload));
-
-    payload->border = border;
-    payload->border_wid = border->wid;
-    payload->settings = *border_get_settings(border);
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-      yabai_proxy_end_proc(payload);
-    });
-  }
-  if (border) pthread_mutex_unlock(&border->mutex);
+static inline void yabai_proxy_end(struct table* windows,
+                                   uint32_t wid,
+                                   uint32_t real_wid) {
+  if (!windows || !real_wid || !wid) return;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    yabai_proxy_end_on_main(windows, wid, real_wid, 0);
+  });
 }
 
 static void yabai_message(CFMachPortRef port, void* data, CFIndex size, void* context) {
-  if (size == sizeof(struct mach_message)) {
-    struct mach_message* message = data;
+  (void)port;
+  if (size < 0) return;
 
-    struct payload {
-      uint32_t event;
-      uint32_t count;
-      uint32_t proxy_wid[512];
-      uint32_t real_wid[512];
-    };
+  void* payload_data = NULL;
+  uint32_t payload_size = 0;
+  if (!mach_message_get_payload(data,
+                                (size_t)size,
+                                &payload_data,
+                                &payload_size)) {
+    mach_destroy_received_message(data, (size_t)size);
+    return;
+  }
 
-    if (message->descriptor.size == sizeof(struct payload)) {
-      struct payload* payload = message->descriptor.address;
+  struct payload {
+    uint32_t event;
+    uint32_t count;
+    uint32_t proxy_wid[512];
+    uint32_t real_wid[512];
+  };
+
+  if (payload_size == sizeof(struct payload) && payload_data && context) {
+    struct payload* payload = payload_data;
+    // A count larger than the wire-format arrays means the whole event is
+    // malformed. Reject it instead of executing a truncated subset.
+    if (payload->count <= 512) {
       if (payload->event == 1325) {
-        for (int i = 0; i < payload->count; i++) {
+        for (uint32_t i = 0; i < payload->count; i++) {
           yabai_proxy_begin(context,
                             payload->proxy_wid[i],
                             payload->real_wid[i]  );
         }
       } else if (payload->event == 1326) {
-        for (int i = 0; i < payload->count; i++) {
+        for (uint32_t i = 0; i < payload->count; i++) {
           yabai_proxy_end(context,
                           payload->proxy_wid[i],
                           payload->real_wid[i]  );
         }
       }
     }
-    mach_msg_destroy(&message->header);
   }
+  mach_destroy_received_message(data, (size_t)size);
 }
 
 static inline void yabai_register_mach_port(struct table* windows) {
   ipc_space_t task = mach_task_self();
-  mach_port_t port;
+  mach_port_t port = MACH_PORT_NULL;
+  CFMachPortRef cf_mach_port = NULL;
+  CFRunLoopSourceRef source = NULL;
   if (mach_port_allocate(task,
                          MACH_PORT_RIGHT_RECEIVE,
                          &port                   ) != KERN_SUCCESS) {
@@ -236,25 +363,46 @@ static inline void yabai_register_mach_port(struct table* windows) {
                                MACH_PORT_LIMITS_INFO,
                                (mach_port_info_t)&limits,
                                MACH_PORT_LIMITS_INFO_COUNT) != KERN_SUCCESS) {
-    return;
+    goto registration_failed;
   }
 
-  if (!mach_register_port(port, "git.felix.jbevent")) return;
+  if (mach_port_insert_right(task,
+                             port,
+                             port,
+                             MACH_MSG_TYPE_MAKE_SEND) != KERN_SUCCESS) {
+    goto registration_failed;
+  }
 
-  CFMachPortContext context = {0, (void*)windows};
+  CFMachPortContext context = {
+    .version = 0,
+    .info = (void*)windows,
+    .retain = NULL,
+    .release = NULL,
+    .copyDescription = NULL
+  };
 
-  CFMachPortRef cf_mach_port = CFMachPortCreateWithPort(NULL,
-                                                        port,
-                                                        yabai_message,
-                                                        &context,
-                                                        false         );
+  cf_mach_port = CFMachPortCreateWithPort(NULL,
+                                         port,
+                                         yabai_message,
+                                         &context,
+                                         false         );
+  if (!cf_mach_port) goto registration_failed;
 
-  CFRunLoopSourceRef source = CFMachPortCreateRunLoopSource(NULL,
-                                                            cf_mach_port,
-                                                            0            );
+  source = CFMachPortCreateRunLoopSource(NULL, cf_mach_port, 0);
+  if (!source) goto registration_failed;
+
+  if (!mach_register_port(port, "git.felix.jbevent")) {
+    goto registration_failed;
+  }
 
   CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopDefaultMode);
   CFRelease(source);
   CFRelease(cf_mach_port);
+  return;
+
+registration_failed:
+  if (source) CFRelease(source);
+  if (cf_mach_port) CFRelease(cf_mach_port);
+  mach_dispose_port(task, &port);
 }
 #endif

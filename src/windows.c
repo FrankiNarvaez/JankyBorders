@@ -1,12 +1,340 @@
 #include "windows.h"
+#include "active_only.h"
+#include "adaptive_lifecycle.h"
+#include "edge_sampler.h"
+#include "focus_recovery.h"
 #include "hashtable.h"
 #include "border.h"
 #include "misc/ax.h"
+#include <limits.h>
+#include <stdio.h>
+#include <stdint.h>
 #include <string.h>
+#include <time.h>
 #include <libproc.h>
 
 extern pid_t g_pid;
 extern struct settings g_settings;
+extern struct table g_windows;
+
+#define ADAPTIVE_FOCUS_DEBOUNCE_MS UINT64_C(80)
+#define ADAPTIVE_RESIZE_DEBOUNCE_MS UINT64_C(150)
+#define ADAPTIVE_RETRY_DELAY_MS UINT64_C(250)
+#define ADAPTIVE_MIN_CAPTURE_INTERVAL_MS UINT64_C(250)
+#define ADAPTIVE_COLOR_CONFIRM_DELAY_MS UINT64_C(250)
+#define ADAPTIVE_NS_PER_MS UINT64_C(1000000)
+
+static struct adaptive_pending_capture adaptive_pending;
+static struct adaptive_pending_capture adaptive_in_flight_request;
+static uint64_t adaptive_generation;
+static uint64_t adaptive_serial;
+static uint64_t adaptive_last_capture_start_ns;
+static bool adaptive_capture_in_flight;
+static bool adaptive_attempts_disabled;
+static bool adaptive_failure_logged;
+static bool adaptive_space_consistency_pass;
+static int focus_committed_front_cid;
+static struct focus_recovery_fallback_snapshot focus_fallback_snapshot;
+
+static const struct adaptive_color_palette* windows_adaptive_palette(
+    enum adaptive_color_mode mode) {
+  switch (mode) {
+    case ADAPTIVE_COLOR_MODE_ACTIVE:
+      return &ADAPTIVE_COLOR_PALETTE_BLACK_WHITE;
+    case ADAPTIVE_COLOR_MODE_FOCUS:
+      return &ADAPTIVE_COLOR_PALETTE_FOCUS;
+    case ADAPTIVE_COLOR_MODE_OFF:
+      return NULL;
+  }
+  return NULL;
+}
+
+static uint64_t windows_adaptive_now_ns(void) {
+  struct timespec now;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+  return (uint64_t)now.tv_sec * UINT64_C(1000000000)
+         + (uint64_t)now.tv_nsec;
+}
+
+static uint64_t windows_adaptive_add_ms(uint64_t now, uint64_t delay_ms) {
+  uint64_t delay = delay_ms * ADAPTIVE_NS_PER_MS;
+  return now > UINT64_MAX - delay ? UINT64_MAX : now + delay;
+}
+
+static uint64_t windows_adaptive_next_generation(void) {
+  adaptive_generation = adaptive_lifecycle_next_nonzero(adaptive_generation);
+  return adaptive_generation;
+}
+
+static uint64_t windows_adaptive_next_serial(void) {
+  adaptive_serial = adaptive_lifecycle_next_nonzero(adaptive_serial);
+  return adaptive_serial;
+}
+
+static bool windows_adaptive_token_is_current(
+    struct adaptive_capture_token token,
+    struct border** current_border) {
+  struct border* border = table_find(&g_windows, &token.wid);
+  bool matches = border
+                 && adaptive_capture_token_matches(
+                     token,
+                     border->target_wid,
+                     border->adaptive_generation,
+                     adaptive_color_mode_is_enabled(
+                         g_settings.adaptive_color),
+                     border->focused,
+                     border->destroying);
+  if (current_border) *current_border = matches ? border : NULL;
+  return matches;
+}
+
+static void windows_adaptive_schedule_pump(uint64_t serial,
+                                           uint64_t delay_ns);
+static void windows_adaptive_schedule_border(struct border* border,
+                                             uint64_t debounce_ms);
+
+static void windows_adaptive_invalidate_border(struct border* border,
+                                                bool clear_cache) {
+  if (!border) return;
+  border->adaptive_generation = windows_adaptive_next_generation();
+  adaptive_pending_cancel_window(&adaptive_pending, border->target_wid);
+  adaptive_color_switch_confirmation_reset(
+      &border->adaptive_color_confirmation);
+  if (clear_cache && border->adaptive_color_cache.valid_mask) {
+    border->adaptive_color_cache.valid_mask = 0;
+    border->needs_redraw = true;
+  }
+}
+
+static void windows_adaptive_clear_all(struct table* windows) {
+  adaptive_pending.valid = false;
+  (void)windows_adaptive_next_serial();
+  if (!windows || !windows->buckets) return;
+  for (int i = 0; i < windows->capacity; ++i) {
+    struct bucket* bucket = windows->buckets[i];
+    while (bucket) {
+      struct border* border = bucket->value;
+      if (border) {
+        windows_adaptive_invalidate_border(border, true);
+        if (border->focused) border_update(border, true);
+      }
+      bucket = bucket->next;
+    }
+  }
+}
+
+static void windows_adaptive_disable_attempts(const char* reason) {
+  adaptive_attempts_disabled = true;
+  if (!adaptive_failure_logged) {
+    fprintf(stderr,
+            "[?] Borders: Adaptive color disabled until restart: %s. "
+            "Run 'make request-screen-capture', grant access, then "
+            "'make service-restart'.\n",
+            reason);
+    adaptive_failure_logged = true;
+  }
+  windows_adaptive_clear_all(&g_windows);
+}
+
+static bool windows_adaptive_is_transient(enum edge_sampler_status status) {
+  return status == EDGE_SAMPLER_WINDOW_NOT_FOUND
+         || status == EDGE_SAMPLER_CONTENT_UNAVAILABLE
+         || status == EDGE_SAMPLER_CAPTURE_FAILED;
+}
+
+static void windows_adaptive_capture_complete(
+    const struct edge_sampler_result* result,
+    void* context) {
+  (void)context;
+  struct adaptive_pending_capture finished = adaptive_in_flight_request;
+  adaptive_capture_in_flight = false;
+  memset(&adaptive_in_flight_request, 0, sizeof(adaptive_in_flight_request));
+
+  if (!result
+      || result->wid != finished.token.wid
+      || result->generation != finished.token.generation) {
+    if (adaptive_pending.valid) {
+      windows_adaptive_schedule_pump(adaptive_pending.serial, 0);
+    }
+    return;
+  }
+
+  struct border* border = NULL;
+  bool current = windows_adaptive_token_is_current(finished.token, &border);
+  if (current && result->status == EDGE_SAMPLER_CAPTURE_PERMISSION_DENIED) {
+    windows_adaptive_disable_attempts("screen capture permission is not granted");
+  } else if (current && result->status == EDGE_SAMPLER_UNSUPPORTED) {
+    windows_adaptive_disable_attempts("ScreenCaptureKit is unavailable");
+  } else if (current
+             && result->status == EDGE_SAMPLER_OK
+             && result->has_analysis
+             && result->analysis_status == ADAPTIVE_COLOR_OK) {
+    uint8_t next_mask = result->analysis.cache_mask
+                        & (uint8_t)((1u << ADAPTIVE_COLOR_SIDE_COUNT) - 1u);
+    bool commit_result = true;
+    if (g_settings.adaptive_color == ADAPTIVE_COLOR_MODE_FOCUS) {
+      struct adaptive_color_cache proposed = { .valid_mask = next_mask };
+      memcpy(proposed.colors,
+             result->analysis.colors,
+             sizeof(proposed.colors));
+      uint32_t current_color = 0;
+      uint32_t proposed_color = 0;
+      bool current_valid = adaptive_color_uniform_cache_color(
+          &ADAPTIVE_COLOR_PALETTE_FOCUS,
+          &border->adaptive_color_cache,
+          &current_color);
+      bool proposed_valid = adaptive_color_uniform_cache_color(
+          &ADAPTIVE_COLOR_PALETTE_FOCUS,
+          &proposed,
+          &proposed_color);
+      if (proposed_valid) {
+        commit_result = adaptive_color_switch_confirmation_accept(
+            &border->adaptive_color_confirmation,
+            current_valid,
+            current_color,
+            proposed_color);
+      } else {
+        adaptive_color_switch_confirmation_reset(
+            &border->adaptive_color_confirmation);
+      }
+    }
+
+    if (!commit_result) {
+      windows_adaptive_schedule_border(border,
+                                       ADAPTIVE_COLOR_CONFIRM_DELAY_MS);
+    } else {
+      bool changed = next_mask != border->adaptive_color_cache.valid_mask;
+      for (size_t side = 0; side < ADAPTIVE_COLOR_SIDE_COUNT; ++side) {
+        uint8_t side_mask = ADAPTIVE_COLOR_SIDE_MASK(side);
+        if ((next_mask & side_mask)
+            && (!(border->adaptive_color_cache.valid_mask & side_mask)
+                || border->adaptive_color_cache.colors[side]
+                   != result->analysis.colors[side])) {
+          changed = true;
+        }
+        if (next_mask & side_mask) {
+          border->adaptive_color_cache.colors[side]
+              = result->analysis.colors[side];
+        }
+      }
+      border->adaptive_color_cache.valid_mask = next_mask;
+      if (changed) {
+        border->needs_redraw = true;
+        border_update(border, true);
+      }
+    }
+  } else if (current
+             && windows_adaptive_is_transient(result->status)
+             && finished.retry_count == 0
+             && !adaptive_pending.valid) {
+    uint64_t serial = windows_adaptive_next_serial();
+    adaptive_pending_replace(
+        &adaptive_pending,
+        finished.token,
+        serial,
+        windows_adaptive_add_ms(windows_adaptive_now_ns(),
+                                ADAPTIVE_RETRY_DELAY_MS),
+        1);
+    windows_adaptive_schedule_pump(serial,
+                                   ADAPTIVE_RETRY_DELAY_MS
+                                   * ADAPTIVE_NS_PER_MS);
+  } else if (current
+             && (windows_adaptive_is_transient(result->status)
+                 || result->status == EDGE_SAMPLER_INVALID_IMAGE
+                 || result->status == EDGE_SAMPLER_ANALYSIS_FAILED)) {
+    adaptive_color_switch_confirmation_reset(
+        &border->adaptive_color_confirmation);
+    if (g_settings.adaptive_color != ADAPTIVE_COLOR_MODE_FOCUS
+        && border->adaptive_color_cache.valid_mask) {
+      border->adaptive_color_cache.valid_mask = 0;
+      border->needs_redraw = true;
+      border_update(border, true);
+    }
+  }
+
+  if (adaptive_pending.valid) {
+    windows_adaptive_schedule_pump(adaptive_pending.serial, 0);
+  }
+}
+
+static void windows_adaptive_capture_pump(uint64_t serial) {
+  if (!adaptive_pending.valid || adaptive_pending.serial != serial) return;
+  if (!adaptive_color_mode_is_enabled(g_settings.adaptive_color)
+      || adaptive_attempts_disabled) {
+    adaptive_pending.valid = false;
+    return;
+  }
+  if (adaptive_capture_in_flight) return;
+
+  uint64_t now = windows_adaptive_now_ns();
+  uint64_t earliest = adaptive_pending.ready_at_ns;
+  if (adaptive_last_capture_start_ns) {
+    uint64_t interval_end = windows_adaptive_add_ms(
+        adaptive_last_capture_start_ns,
+        ADAPTIVE_MIN_CAPTURE_INTERVAL_MS);
+    if (interval_end > earliest) earliest = interval_end;
+  }
+  if (now < earliest) {
+    windows_adaptive_schedule_pump(serial, earliest - now);
+    return;
+  }
+
+  struct adaptive_pending_capture request = adaptive_pending;
+  adaptive_pending.valid = false;
+  struct border* border = NULL;
+  if (!windows_adaptive_token_is_current(request.token, &border)) return;
+
+  uint32_t fallback[ADAPTIVE_COLOR_SIDE_COUNT];
+  border_adaptive_fallback_colors(border, fallback);
+  const struct adaptive_color_palette* palette = windows_adaptive_palette(
+      g_settings.adaptive_color);
+  if (!palette) return;
+  adaptive_capture_in_flight = true;
+  adaptive_in_flight_request = request;
+  adaptive_last_capture_start_ns = now;
+  edge_sampler_capture(request.token.wid,
+                       request.token.generation,
+                       palette,
+                       &border->adaptive_color_cache,
+                       fallback,
+                       windows_adaptive_capture_complete,
+                       NULL);
+}
+
+static void windows_adaptive_schedule_pump(uint64_t serial,
+                                           uint64_t delay_ns) {
+  int64_t dispatch_delay = delay_ns > (uint64_t)INT64_MAX
+                           ? INT64_MAX
+                           : (int64_t)delay_ns;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, dispatch_delay),
+                 dispatch_get_main_queue(), ^{
+    windows_adaptive_capture_pump(serial);
+  });
+}
+
+static void windows_adaptive_schedule_border(struct border* border,
+                                             uint64_t debounce_ms) {
+  if (!border
+      || !adaptive_color_mode_is_enabled(g_settings.adaptive_color)
+      || adaptive_attempts_disabled
+      || adaptive_space_consistency_pass
+      || !border->focused
+      || border->destroying) return;
+
+  struct adaptive_capture_token token = {
+    .wid = border->target_wid,
+    .generation = windows_adaptive_next_generation(),
+  };
+  border->adaptive_generation = token.generation;
+  uint64_t serial = windows_adaptive_next_serial();
+  adaptive_pending_replace(
+      &adaptive_pending,
+      token,
+      serial,
+      windows_adaptive_add_ms(windows_adaptive_now_ns(), debounce_ms),
+      0);
+  windows_adaptive_schedule_pump(serial, debounce_ms * ADAPTIVE_NS_PER_MS);
+}
 
 // Loaded via dlsym in main.c
 extern CFArrayRef (*JBSLSWindowIteratorGetCornerRadii)(CFTypeRef);
@@ -16,30 +344,220 @@ static bool window_in_list(struct table* list, char* app_name) {
   return false;
 }
 
-static bool app_allowed(struct settings* settings, char* app_name) {
-  if (settings->whitelist_enabled
-      && !window_in_list(&settings->whitelist, app_name)) {
+static bool app_allowed(char* app_name) {
+  if (g_whitelist_enabled && !window_in_list(&g_whitelist, app_name)) {
     return false;
   }
-  if (settings->blacklist_enabled
-      && window_in_list(&settings->blacklist, app_name)) {
+  if (g_blacklist_enabled && window_in_list(&g_blacklist, app_name)) {
     return false;
   }
   return true;
 }
 
-bool windows_window_create(struct table* windows, uint32_t wid, uint64_t sid) {
-  bool window_created = false;
-  int cid = SLSMainConnectionID();
+enum window_tracking_eligibility {
+  WINDOW_TRACKING_ALLOWED,
+  WINDOW_TRACKING_REJECTED,
+  WINDOW_TRACKING_TRANSIENT,
+};
+
+static enum window_tracking_eligibility windows_window_eligibility(
+    int cid,
+    uint32_t wid) {
   int wid_cid = 0;
-  SLSGetWindowOwner(cid, wid, &wid_cid);
+  if (SLSGetWindowOwner(cid, wid, &wid_cid) != kCGErrorSuccess
+      || wid_cid <= 0) {
+    return WINDOW_TRACKING_TRANSIENT;
+  }
 
   pid_t pid = 0;
-  SLSConnectionGetPID(wid_cid, &pid);
-  static char pid_name_buffer[PROC_PIDPATHINFO_MAXSIZE];
-  proc_name(pid, pid_name_buffer, sizeof(pid_name_buffer));
+  if (SLSConnectionGetPID(wid_cid, &pid) != kCGErrorSuccess || pid <= 0) {
+    return WINDOW_TRACKING_TRANSIENT;
+  }
 
-  if (pid == g_pid || !app_allowed(&g_settings, pid_name_buffer)) return false;
+  char pid_name_buffer[PROC_PIDPATHINFO_MAXSIZE] = { 0 };
+  if (proc_name(pid, pid_name_buffer, sizeof(pid_name_buffer)) <= 0) {
+    return WINDOW_TRACKING_TRANSIENT;
+  }
+
+  if (pid == g_pid
+      || g_settings.border_style == BORDER_STYLE_NONE
+      || !app_allowed(pid_name_buffer)) {
+    return WINDOW_TRACKING_REJECTED;
+  }
+  return WINDOW_TRACKING_ALLOWED;
+}
+
+static struct front_window_resolution windows_resolve_front_window(int cid) {
+  if (g_settings.ax_focus) {
+    uint32_t wid = ax_get_front_window(cid);
+    if (wid) {
+      struct front_window_resolution result = {
+        .status = FRONT_WINDOW_RESOLUTION_RESOLVED,
+        .wid = wid,
+        .active_space_wid = 0,
+        .front_cid = 0,
+        .candidate_count = 1,
+      };
+      if (SLSGetWindowOwner(cid, wid, &result.front_cid)
+              == kCGErrorSuccess
+          && result.front_cid > 0) {
+        return result;
+      }
+    }
+  }
+
+  return resolve_front_window(cid);
+}
+
+static uint32_t windows_active_window_id(int cid) {
+  struct front_window_resolution result = windows_resolve_front_window(cid);
+  return result.status == FRONT_WINDOW_RESOLUTION_RESOLVED ? result.wid : 0;
+}
+
+void windows_focus_probe_reset(void) {
+  focus_recovery_fallback_reset(&focus_fallback_snapshot);
+}
+
+static void windows_remove_all_except(struct table* windows, uint32_t wid) {
+  if (!g_settings.active_only) return;
+
+  bool removed_window = false;
+
+  for (int i = 0; i < windows->capacity; ++i) {
+    struct bucket** bucket = &windows->buckets[i];
+    while (*bucket) {
+      struct bucket* current = *bucket;
+      struct border* border = current->value;
+
+      if (border
+          && active_only_should_remove_window(g_settings.active_only,
+                                              border->target_wid,
+                                              wid)) {
+        *bucket = current->next;
+        free(current->key);
+        free(current);
+        --windows->count;
+        windows_adaptive_invalidate_border(border, true);
+        border_destroy(border);
+        removed_window = true;
+      } else {
+        bucket = &current->next;
+      }
+    }
+  }
+
+  if (removed_window) windows_update_notifications(windows);
+}
+
+// Fade-out of the focused border. Everything below runs on the main dispatch
+// queue. Delayed steps carry only {wid, generation, start}; they re-resolve the
+// border through g_windows, so a destroyed or reused border can never be
+// touched through a stale pointer, and any newer focus, focus loss, settings
+// change or destruction invalidates them through the generation token.
+static uint64_t fade_generation;
+
+struct fade_token {
+  uint32_t wid;
+  uint64_t generation;
+  uint64_t start_ns;
+};
+
+static void windows_fade_set_alpha(struct border* border, float alpha) {
+  pthread_mutex_lock(&border->mutex);
+  // While a yabai proxy stands in for the border, the parent helper must stay
+  // transparent; the proxy shows the fade instead, and
+  // yabai_restore_parent_alpha applies fade_alpha to the parent afterwards.
+  bool proxied = border->proxy || border->external_proxy_wid;
+  bool changed = alpha != border->fade_alpha
+                 || (border->wid != border->fade_alpha_wid && alpha != 1.0f);
+  if (changed && proxied) {
+    if (border->proxy && border->proxy->wid) {
+      SLSSetWindowAlpha(border->proxy->cid, border->proxy->wid, alpha);
+    }
+  } else if (border->wid && changed) {
+    SLSSetWindowAlpha(border->cid, border->wid, alpha);
+    border->fade_alpha_wid = border->wid;
+  }
+  border->fade_alpha = alpha;
+  pthread_mutex_unlock(&border->mutex);
+}
+
+static void windows_fade_schedule(struct fade_token token, uint64_t delay_ns) {
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)delay_ns),
+                 dispatch_get_main_queue(),
+                 ^{
+    uint32_t wid = token.wid;
+    struct border* border = table_find(&g_windows, &wid);
+    if (!border
+        || !fade_token_matches(token.generation,
+                               border->fade_generation,
+                               border->focused,
+                               border->destroying,
+                               g_settings.fade.enabled)) {
+      return;
+    }
+
+    uint64_t now = windows_adaptive_now_ns();
+    uint64_t elapsed = now > token.start_ns ? now - token.start_ns : 0;
+    float alpha = fade_alpha_at(&g_settings.fade, elapsed);
+    windows_fade_set_alpha(border, alpha);
+    if (alpha > 0.0f) windows_fade_schedule(token, FADE_STEP_NS);
+  });
+}
+
+// Invalidates pending fade steps without touching the helper alpha.
+static void windows_fade_invalidate(struct border* border) {
+  border->fade_generation = fade_next_generation(fade_generation);
+  fade_generation = border->fade_generation;
+}
+
+static void windows_fade_cancel(struct border* border) {
+  windows_fade_invalidate(border);
+  windows_fade_set_alpha(border, 1.0f);
+}
+
+static void windows_fade_restart(struct border* border) {
+  windows_fade_cancel(border);
+  if (!g_settings.fade.enabled || !border->focused || border->destroying) {
+    return;
+  }
+
+  struct fade_token token = { .wid = border->target_wid,
+                              .generation = border->fade_generation,
+                              .start_ns = windows_adaptive_now_ns() };
+  windows_fade_schedule(token, fade_delay_ns(&g_settings.fade));
+}
+
+void windows_fade_settings_changed(struct table* windows) {
+  for (int i = 0; i < windows->capacity; ++i) {
+    struct bucket* bucket = windows->buckets[i];
+    while (bucket) {
+      if (bucket->value) {
+        struct border* border = bucket->value;
+        if (border->focused) windows_fade_restart(border);
+        else windows_fade_cancel(border);
+      }
+      bucket = bucket->next;
+    }
+  }
+}
+
+static bool windows_window_create_internal(struct table* windows,
+                                           uint32_t wid,
+                                           uint64_t sid,
+                                           bool confirmed_focus) {
+  bool window_created = false;
+  int cid = SLSMainConnectionID();
+  if (windows_window_eligibility(cid, wid) != WINDOW_TRACKING_ALLOWED) {
+    return false;
+  }
+  if (g_settings.active_only
+      && !confirmed_focus
+      && !active_only_should_track_window(true,
+                                          wid,
+                                          windows_active_window_id(cid))) {
+    return false;
+  }
 
   CFArrayRef target_ref = cfarray_of_cfnumbers(&wid,
                                                sizeof(uint32_t),
@@ -57,7 +575,16 @@ bool windows_window_create(struct table* windows, uint32_t wid, uint64_t sid) {
           struct border* border = table_find(windows, &wid);
           if (!border) {
             border = border_create();
-            table_add(windows, &wid, border);
+            if (!border || !table_add(windows, &wid, border)) {
+              if (border) border_destroy(border);
+              if (iterator) CFRelease(iterator);
+              CFRelease(query);
+              CFRelease(target_ref);
+              return false;
+            }
+            // Zero-initialised borders would read as fully transparent;
+            // fade_alpha records the helper alpha, 1 meaning untouched.
+            border->fade_alpha = 1.0f;
             window_created = true;
           }
 
@@ -68,7 +595,9 @@ bool windows_window_create(struct table* windows, uint32_t wid, uint64_t sid) {
             CFArrayRef radii_ref = JBSLSWindowIteratorGetCornerRadii(iterator);
             if (radii_ref && CFArrayGetCount(radii_ref) > 0) {
               CFNumberRef value = CFArrayGetValueAtIndex(radii_ref, 0);
-              CFNumberGetValue(value, kCFNumberSInt32Type, &radius);
+              if (value && CFGetTypeID(value) == CFNumberGetTypeID()) {
+                CFNumberGetValue(value, kCFNumberSInt32Type, &radius);
+              }
             }
             if (radii_ref) CFRelease(radii_ref);
           }
@@ -78,6 +607,9 @@ bool windows_window_create(struct table* windows, uint32_t wid, uint64_t sid) {
           border->inner_radius = radius + 1;
           border->target_wid = wid;
           border->sid = sid;
+          // Creation only prepares an unfocused helper. The central resolver
+          // is the sole authority that commits focus after the active helper
+          // has been drawn and placed successfully.
           border_update(border, false);
           windows_update_notifications(windows);
         }
@@ -91,24 +623,39 @@ bool windows_window_create(struct table* windows, uint32_t wid, uint64_t sid) {
   return window_created;
 }
 
-static void windows_remove_all(struct table* windows) {
+bool windows_window_create(struct table* windows, uint32_t wid, uint64_t sid) {
+  bool created = windows_window_create_internal(windows, wid, sid, false);
+  if (!created
+      && g_settings.active_only
+      && windows_window_eligibility(SLSMainConnectionID(), wid)
+         == WINDOW_TRACKING_ALLOWED) {
+    windows_update_notifications(windows);
+  }
+  return created;
+}
+
+static bool windows_remove_all(struct table* windows) {
+  if (!windows || !windows->buckets || windows->capacity <= 0) return false;
   for (int i = 0; i < windows->capacity; ++i) {
     struct bucket* bucket = windows->buckets[i];
     while (bucket) {
       if (bucket->value) {
         struct border* border = bucket->value;
+        windows_adaptive_invalidate_border(border, true);
         border_destroy(border);
       }
       bucket = bucket->next;
     }
   }
-  table_clear(windows);
+  if (!table_clear(windows)) return false;
   windows_update_notifications(windows);
+  return true;
 }
 
 void windows_recreate_all_borders(struct table* windows) {
-  windows_remove_all(windows);
+  if (!windows_remove_all(windows)) return;
   windows_add_existing_windows(windows);
+  windows_focus_probe_reset();
 }
 
 void windows_update_all(struct table* windows) {
@@ -164,32 +711,68 @@ void windows_window_update(struct table* windows, uint32_t wid) {
   if (border) border_update(border, true);
 }
 
+void windows_window_resize(struct table* windows, uint32_t wid) {
+  struct border* border = table_find(windows, &wid);
+  if (!border) return;
+  border_update(border, true);
+  if (border->focused) {
+    windows_adaptive_schedule_border(border, ADAPTIVE_RESIZE_DEBOUNCE_MS);
+  }
+}
+
 static bool windows_window_focus(struct table* windows, uint32_t wid) {
-  bool found_window = false;
+  struct border* target = wid ? table_find(windows, &wid) : NULL;
+  if (wid && !target) return false;
+
+  bool newly_focused = target && !target->focused;
+  if (newly_focused) {
+    // Draw the confirmed target before retiring the old focus. WindowServer
+    // may flush the two helpers independently, so a short overlap is less
+    // disruptive than a frame with no visible focus indicator.
+    target->focused = true;
+    target->needs_redraw = true;
+    struct settings* target_settings = border_get_settings(target);
+    bool intentionally_hidden = border_settings_hidden(target_settings);
+    if (intentionally_hidden) {
+      border_hide(target);
+    } else if (!border_update(target, true)) {
+      target->focused = false;
+      target->needs_redraw = true;
+      border_hide(target);
+      return false;
+    }
+  }
+
   for (int i = 0; i < windows->capacity; ++i) {
     struct bucket* bucket = windows->buckets[i];
     while (bucket) {
       if (bucket->value) {
         struct border* border = bucket->value;
-        if (border->focused && border->target_wid != wid) {
+        if (border != target && border->focused) {
           border->focused = false;
-          border->needs_redraw = true;
-          border_update(border, true);
+          windows_adaptive_invalidate_border(border, false);
+          // Restore full alpha only after the inactive redraw, so a faded
+          // border never flashes back in the active color. Active-only
+          // borders are hidden or removed instead; a later focus restores
+          // them through windows_fade_restart.
+          windows_fade_invalidate(border);
+          if (!g_settings.active_only) {
+            border->needs_redraw = true;
+            if (!border_update(border, true)) border_hide(border);
+            windows_fade_set_alpha(border, 1.0f);
+          }
         }
-
-        if (!border->focused && border->target_wid == wid) {
-          border->focused = true;
-          border->needs_redraw = true;
-          border_update(border, true);
-        }
-
-        if (border->target_wid == wid) found_window = true;
       }
       bucket = bucket->next;
     }
   }
 
-  return found_window;
+  if (newly_focused) {
+    windows_fade_restart(target);
+    windows_adaptive_schedule_border(target, ADAPTIVE_FOCUS_DEBOUNCE_MS);
+  }
+
+  return true;
 }
 
 void windows_window_move(struct table* windows, uint32_t wid) {
@@ -199,17 +782,30 @@ void windows_window_move(struct table* windows, uint32_t wid) {
 
 void windows_window_hide(struct table* windows, uint32_t wid) {
   struct border* border = table_find(windows, &wid);
-  if (border) border_hide(border);
+  if (border) {
+    bool keep_focus_cache =
+        g_settings.adaptive_color == ADAPTIVE_COLOR_MODE_FOCUS;
+    windows_adaptive_invalidate_border(border, !keep_focus_cache);
+    border_hide(border);
+  }
 }
 
 void windows_window_unhide(struct table* windows, uint32_t wid) {
   struct border* border = table_find(windows, &wid);
-  if (border) border_unhide(border);
+  if (border) {
+    if (border->needs_redraw) border_update(border, true);
+    border_unhide(border);
+    if (border->focused) {
+      windows_adaptive_schedule_border(border,
+                                       ADAPTIVE_FOCUS_DEBOUNCE_MS);
+    }
+  }
 }
 
 bool windows_window_destroy(struct table* windows, uint32_t wid, uint32_t sid) {
   struct border* border = table_find(windows, &wid);
   if (border && (border->sid == sid || border->sticky || sid == 0)) {
+    windows_adaptive_invalidate_border(border, true);
     table_remove(windows, &wid);
     border_destroy(border);
     windows_update_notifications(windows);
@@ -218,48 +814,22 @@ bool windows_window_destroy(struct table* windows, uint32_t wid, uint32_t sid) {
   return false;
 }
 
-void windows_update_notifications(struct table* windows) {
-  int window_count = 0;
-  uint32_t window_list[1024] = {};
-
-  for (int i = 0; i < windows->capacity; ++i) {
-    struct bucket *bucket = windows->buckets[i];
-    while (bucket) {
-      if (bucket->value) {
-        uint32_t wid = *(uint32_t *) bucket->key;
-        window_list[window_count++] = wid;
-      }
-      bucket = bucket->next;
-    }
-  }
-
-  int cid = SLSMainConnectionID();
-  SLSRequestNotificationsForWindows(cid, window_list, window_count);
-}
-
-void windows_determine_and_focus_active_window(struct table* windows) {
-  int cid = SLSMainConnectionID();
-  uint32_t front_wid = g_settings.ax_focus
-                       ? ax_get_front_window(cid)
-                       : get_front_window(cid);
-
-  debug("Front window: %d\n", front_wid);
-  if (!windows_window_focus(windows, front_wid)) {
-    debug("Taking slow window focus path: %d\n", front_wid);
-    if (front_wid && windows_window_create(windows,
-                                           front_wid,
-                                           window_space_id(cid, front_wid))) {
-      windows_window_focus(windows, front_wid);
-    }
-  }
-}
-
-void windows_draw_borders_on_current_spaces(struct table* windows) {
-  debug("Space Change: Consistency check\n");
-  int cid = SLSMainConnectionID();
+static CFArrayRef windows_copy_current_space_windows(int cid) {
   CFArrayRef displays = SLSCopyManagedDisplays(cid);
-  uint32_t space_count = CFArrayGetCount(displays);
-  uint64_t space_list[space_count];
+  if (!displays) return NULL;
+
+  CFIndex space_count_ref = CFArrayGetCount(displays);
+  if (space_count_ref <= 0 || space_count_ref > INT_MAX
+      || (size_t)space_count_ref > SIZE_MAX / sizeof(uint64_t)) {
+    CFRelease(displays);
+    return NULL;
+  }
+  int space_count = (int)space_count_ref;
+  uint64_t* space_list = calloc((size_t)space_count, sizeof(uint64_t));
+  if (!space_list) {
+    CFRelease(displays);
+    return NULL;
+  }
 
   for (int i = 0; i < space_count; i++) {
     space_list[i] = SLSManagedDisplayGetCurrentSpace(cid,
@@ -272,6 +842,8 @@ void windows_draw_borders_on_current_spaces(struct table* windows) {
                                                    sizeof(uint64_t),
                                                    space_count,
                                                    kCFNumberSInt64Type);
+  free(space_list);
+  if (!space_list_ref) return NULL;
 
   uint64_t set_tags = 1;
   uint64_t clear_tags = 0;
@@ -281,7 +853,327 @@ void windows_draw_borders_on_current_spaces(struct table* windows) {
                                                             0x2,
                                                             &set_tags,
                                                             &clear_tags    );
+  CFRelease(space_list_ref);
+  return window_list;
+}
 
+static bool window_list_append(uint32_t** list,
+                               size_t* count,
+                               size_t* capacity,
+                               uint32_t wid) {
+  for (size_t i = 0; i < *count; ++i) {
+    if ((*list)[i] == wid) return true;
+  }
+  if (*count == *capacity) {
+    size_t next = *capacity ? *capacity * 2 : 16;
+    if (next > INT_MAX || next > SIZE_MAX / sizeof(uint32_t)) return false;
+    uint32_t* grown = realloc(*list, next * sizeof(uint32_t));
+    if (!grown) return false;
+    *list = grown;
+    *capacity = next;
+  }
+  (*list)[(*count)++] = wid;
+  return true;
+}
+
+// Active-only keeps a helper for the focused window only, but a click that
+// focuses another window of the same application raises no front-application
+// event: WindowServer only reports it as a reorder of that window, and
+// per-window events are only delivered for requested windows. Request them
+// for every window that could receive a border, so focus changes are seen
+// immediately instead of on the next unrelated event.
+static bool windows_append_focus_candidates(int cid,
+                                            uint32_t** list,
+                                            size_t* count,
+                                            size_t* capacity) {
+  CFArrayRef window_list = windows_copy_current_space_windows(cid);
+  if (!window_list) return true;
+
+  bool appended = true;
+  CFTypeRef query = SLSWindowQueryWindows(cid, window_list, 0x0);
+  if (query) {
+    CFTypeRef iterator = SLSWindowQueryResultCopyWindows(query);
+    if (iterator) {
+      while (appended && SLSWindowIteratorAdvance(iterator)) {
+        if (!window_suitable(iterator)) continue;
+        uint32_t wid = SLSWindowIteratorGetWindowID(iterator);
+        if (windows_window_eligibility(cid, wid) != WINDOW_TRACKING_ALLOWED) {
+          continue;
+        }
+        appended = window_list_append(list, count, capacity, wid);
+      }
+      CFRelease(iterator);
+    }
+    CFRelease(query);
+  }
+  CFRelease(window_list);
+  return appended;
+}
+
+void windows_update_notifications(struct table* windows) {
+  if (!windows || windows->capacity < 0) return;
+
+  uint32_t* window_list = NULL;
+  size_t window_count = 0;
+  size_t window_capacity = 0;
+  for (int i = 0; i < windows->capacity; ++i) {
+    struct bucket *bucket = windows->buckets[i];
+    while (bucket) {
+      if (bucket->value
+          && !window_list_append(&window_list,
+                                 &window_count,
+                                 &window_capacity,
+                                 *(uint32_t *) bucket->key)) {
+        free(window_list);
+        return;
+      }
+      bucket = bucket->next;
+    }
+  }
+
+  int cid = SLSMainConnectionID();
+  if (g_settings.active_only
+      && !windows_append_focus_candidates(cid,
+                                          &window_list,
+                                          &window_count,
+                                          &window_capacity)) {
+    free(window_list);
+    return;
+  }
+
+  uint32_t empty_window = 0;
+  SLSRequestNotificationsForWindows(cid,
+                                    window_list ? window_list : &empty_window,
+                                    (int)window_count);
+  free(window_list);
+}
+
+static uint32_t windows_focused_window_id(struct table* windows) {
+  if (!windows || !windows->buckets) return 0;
+  for (int i = 0; i < windows->capacity; ++i) {
+    struct bucket* bucket = windows->buckets[i];
+    while (bucket) {
+      struct border* border = bucket->value;
+      if (border && border->focused) return border->target_wid;
+      bucket = bucket->next;
+    }
+  }
+  return 0;
+}
+
+static enum focus_recovery_resolution windows_focus_resolution_kind(
+    enum front_window_resolution_status status) {
+  switch (status) {
+    case FRONT_WINDOW_RESOLUTION_RESOLVED:
+      return FOCUS_RECOVERY_RESULT_RESOLVED;
+    case FRONT_WINDOW_RESOLUTION_COMPLETE_NONE:
+      return FOCUS_RECOVERY_RESULT_COMPLETE_NONE;
+    case FRONT_WINDOW_RESOLUTION_AMBIGUOUS:
+      return FOCUS_RECOVERY_RESULT_AMBIGUOUS;
+    case FRONT_WINDOW_RESOLUTION_TRANSIENT:
+      return FOCUS_RECOVERY_RESULT_TRANSIENT;
+  }
+  return FOCUS_RECOVERY_RESULT_TRANSIENT;
+}
+
+static void windows_retire_visible_focus(struct table* windows) {
+  uint32_t focused_wid = windows_focused_window_id(windows);
+  if (!focused_wid) return;
+  struct border* focused = table_find(windows, &focused_wid);
+  windows_window_focus(windows, 0);
+  // Active-only does not redraw retired borders as inactive; hide it.
+  if (focused && g_settings.active_only) border_hide(focused);
+}
+
+enum windows_focus_refresh_result windows_refresh_active_window(
+    struct table* windows,
+    bool allow_clear) {
+  int cid = SLSMainConnectionID();
+  struct front_window_resolution resolution = windows_resolve_front_window(cid);
+
+  bool has_fallback_hint = resolution.status
+                           == FRONT_WINDOW_RESOLUTION_AMBIGUOUS
+                           && resolution.active_space_wid;
+  if (has_fallback_hint) {
+    if (focus_recovery_fallback_observe(&focus_fallback_snapshot,
+                                        resolution.front_cid,
+                                        resolution.active_space_wid)) {
+      resolution.status = FRONT_WINDOW_RESOLUTION_RESOLVED;
+      resolution.wid = resolution.active_space_wid;
+    }
+  } else {
+    // Any missing hint or stronger contradictory signal breaks continuity;
+    // only adjacent matching snapshots may authorize the fallback.
+    focus_recovery_fallback_reset(&focus_fallback_snapshot);
+  }
+
+  bool previous_target_matches_front_process =
+      focus_committed_front_cid > 0
+      && focus_committed_front_cid == resolution.front_cid
+      && windows_focused_window_id(windows) != 0;
+  enum focus_recovery_resolution recovery_resolution =
+      windows_focus_resolution_kind(resolution.status);
+  recovery_resolution = focus_recovery_gate_clear(recovery_resolution,
+                                                   allow_clear);
+  enum focus_recovery_decision decision = focus_recovery_decide(
+      recovery_resolution,
+      previous_target_matches_front_process);
+
+  debug("Front window resolution: status=%d wid=%u front_cid=%d "
+        "candidates=%zu clear=%d\n",
+        resolution.status,
+        resolution.wid,
+        resolution.front_cid,
+        resolution.candidate_count,
+        allow_clear);
+
+  if (decision == FOCUS_RECOVERY_SELECT) {
+    uint32_t front_wid = resolution.wid;
+    if (!front_wid) return WINDOWS_FOCUS_REFRESH_HELD;
+
+    enum window_tracking_eligibility eligibility =
+        windows_window_eligibility(cid, front_wid);
+    if (eligibility == WINDOW_TRACKING_REJECTED) {
+      if (!allow_clear) {
+        // A rejected front window (filtered app, own window, style=none) is
+        // a definite answer, so retire the visible focus right away instead
+        // of after the whole probe series. Removing helpers still waits for
+        // the final probe; a transient answer is corrected by the next one.
+        windows_retire_visible_focus(windows);
+        return WINDOWS_FOCUS_REFRESH_HELD;
+      }
+      windows_window_focus(windows, 0);
+      windows_remove_all_except(windows, 0);
+      focus_committed_front_cid = 0;
+      windows_focus_probe_reset();
+      return WINDOWS_FOCUS_REFRESH_CLEARED;
+    }
+    if (eligibility == WINDOW_TRACKING_TRANSIENT) {
+      return WINDOWS_FOCUS_REFRESH_HELD;
+    }
+
+    struct border* target = table_find(windows, &front_wid);
+    if (!target) {
+      debug("Preparing focused window: %u\n", front_wid);
+      if (!windows_window_create_internal(
+              windows,
+              front_wid,
+              window_space_id(cid, front_wid),
+              true)) {
+        return WINDOWS_FOCUS_REFRESH_HELD;
+      }
+      target = table_find(windows, &front_wid);
+    }
+    if (!target) return WINDOWS_FOCUS_REFRESH_HELD;
+    struct settings* target_settings = border_get_settings(target);
+    if (border_settings_hidden(target_settings)) {
+      border_hide(target);
+    } else if (!border_update(target, false)) {
+      return WINDOWS_FOCUS_REFRESH_HELD;
+    }
+
+    if (!windows_window_focus(windows, front_wid)) {
+      return WINDOWS_FOCUS_REFRESH_HELD;
+    }
+    focus_committed_front_cid = resolution.front_cid;
+    windows_focus_probe_reset();
+    windows_remove_all_except(windows, front_wid);
+    return WINDOWS_FOCUS_REFRESH_APPLIED;
+  }
+
+  if (decision == FOCUS_RECOVERY_CLEAR) {
+    windows_window_focus(windows, 0);
+    windows_remove_all_except(windows, 0);
+    focus_committed_front_cid = 0;
+    windows_focus_probe_reset();
+    return WINDOWS_FOCUS_REFRESH_CLEARED;
+  }
+
+  return WINDOWS_FOCUS_REFRESH_HELD;
+}
+
+void windows_adaptive_refresh_active(struct table* windows) {
+  if (!windows || !windows->buckets) return;
+  for (int i = 0; i < windows->capacity; ++i) {
+    struct bucket* bucket = windows->buckets[i];
+    while (bucket) {
+      struct border* border = bucket->value;
+      if (border && border->focused) {
+        windows_adaptive_schedule_border(border, 0);
+        return;
+      }
+      bucket = bucket->next;
+    }
+  }
+}
+
+void windows_adaptive_mode_changed(struct table* windows,
+                                   enum adaptive_color_mode previous,
+                                   enum adaptive_color_mode current) {
+  enum adaptive_color_mode_transition transition =
+      adaptive_color_mode_transition_for(previous, current);
+  if (transition == ADAPTIVE_COLOR_TRANSITION_NONE) return;
+  windows_adaptive_clear_all(windows);
+  if (transition == ADAPTIVE_COLOR_TRANSITION_RESET_AND_REFRESH) {
+    windows_adaptive_refresh_active(windows);
+  }
+}
+
+void windows_adaptive_space_change_started(struct table* windows) {
+  adaptive_space_consistency_pass = true;
+  adaptive_pending.valid = false;
+  (void)windows_adaptive_next_serial();
+  if (!windows || !windows->buckets) return;
+  for (int i = 0; i < windows->capacity; ++i) {
+    struct bucket* bucket = windows->buckets[i];
+    while (bucket) {
+      struct border* border = bucket->value;
+      if (border) windows_adaptive_invalidate_border(border, false);
+      bucket = bucket->next;
+    }
+  }
+}
+
+void windows_hide_all(struct table* windows) {
+  if (!windows || !windows->buckets) return;
+  for (int i = 0; i < windows->capacity; ++i) {
+    struct bucket* bucket = windows->buckets[i];
+    while (bucket) {
+      if (bucket->value) border_hide(bucket->value);
+      bucket = bucket->next;
+    }
+  }
+}
+
+void windows_draw_borders_on_current_spaces(struct table* windows) {
+  debug("Space Change: Consistency check\n");
+
+  // Refresh every tracked window first. A native-fullscreen window can be
+  // absent from the current-Space query while WindowServer is moving it, but
+  // its direct Space lookup may already expose the new SID.
+  for (int i = 0; i < windows->capacity; ++i) {
+    struct bucket* bucket = windows->buckets[i];
+    while (bucket) {
+      if (bucket->value) {
+        border_retry_space_migration(bucket->value);
+        border_update(bucket->value, true);
+      }
+      bucket = bucket->next;
+    }
+  }
+
+  int cid = SLSMainConnectionID();
+
+  // Space events are intentionally handled through the caller's delayed
+  // consistency pass. Native-fullscreen windows may still have their old SID
+  // when the event first arrives, so active-only must not refresh eagerly.
+  // Its focus candidates did change with the Space, though.
+  if (g_settings.active_only) {
+    windows_update_notifications(windows);
+    return;
+  }
+
+  CFArrayRef window_list = windows_copy_current_space_windows(cid);
   if (window_list) {
     CFTypeRef query = SLSWindowQueryWindows(cid, window_list, 0x0);
     if (query) {
@@ -291,8 +1183,7 @@ void windows_draw_borders_on_current_spaces(struct table* windows) {
           if (window_suitable(iterator)) {
             uint32_t wid = SLSWindowIteratorGetWindowID(iterator);
             struct border* border = table_find(windows, &wid);
-            if (border) border_update(border, true);
-            else {
+            if (!border) {
               debug("Creating Missing Window: %d\n", wid);
               windows_window_create(windows, wid, window_space_id(cid, wid));
             }
@@ -304,38 +1195,93 @@ void windows_draw_borders_on_current_spaces(struct table* windows) {
     }
     CFRelease(window_list);
   }
-  CFRelease(space_list_ref);
+}
+
+void windows_refresh_after_space_change(struct table* windows,
+                                        bool final_retry) {
+  // A real Space event keeps adaptive scheduling suppressed for its whole
+  // bounded retry series, including events delivered between consistency
+  // passes. Startup and window-create refreshes do not set that state, so
+  // their ordinary 80/150 ms triggers remain intact.
+  windows_draw_borders_on_current_spaces(windows);
+  windows_refresh_active_window(windows, final_retry);
+  if (final_retry && adaptive_space_consistency_pass) {
+    adaptive_space_consistency_pass = false;
+    windows_adaptive_refresh_active(windows);
+  }
+}
+
+static bool append_space_id(uint64_t** space_list,
+                            size_t* space_count,
+                            size_t* capacity,
+                            uint64_t sid) {
+  if (!space_list || !space_count || !capacity) return false;
+  if (*space_count == *capacity) {
+    size_t new_capacity = *capacity ? *capacity * 2 : 16;
+    if (new_capacity < *capacity
+        || new_capacity > SIZE_MAX / sizeof(uint64_t)) {
+      return false;
+    }
+    uint64_t* resized = realloc(*space_list,
+                                new_capacity * sizeof(uint64_t));
+    if (!resized) return false;
+    *space_list = resized;
+    *capacity = new_capacity;
+  }
+  (*space_list)[(*space_count)++] = sid;
+  return true;
 }
 
 void windows_add_existing_windows(struct table* windows) {
   int cid = SLSMainConnectionID();
+
+  if (g_settings.active_only) return;
+
   uint64_t* space_list = NULL;
-  int space_count = 0;
+  size_t space_count = 0;
+  size_t space_capacity = 0;
+  bool allocation_failed = false;
 
   CFArrayRef display_spaces_ref = SLSCopyManagedDisplaySpaces(cid);
   if (display_spaces_ref) {
-    int display_spaces_count = CFArrayGetCount(display_spaces_ref);
-    for (int i = 0; i < display_spaces_count; ++i) {
+    CFIndex display_spaces_count = CFArrayGetCount(display_spaces_ref);
+    for (CFIndex i = 0; i < display_spaces_count && !allocation_failed; ++i) {
       CFDictionaryRef display_ref
                                = CFArrayGetValueAtIndex(display_spaces_ref, i);
+      if (!display_ref
+          || CFGetTypeID(display_ref) != CFDictionaryGetTypeID()) continue;
+
       CFArrayRef spaces_ref = CFDictionaryGetValue(display_ref,
                                                    CFSTR("Spaces"));
-      int spaces_count = CFArrayGetCount(spaces_ref);
+      if (!spaces_ref || CFGetTypeID(spaces_ref) != CFArrayGetTypeID()) continue;
 
-      space_list = (uint64_t*)realloc(space_list,
-                                      sizeof(uint64_t)*(space_count
-                                                        + spaces_count));
-
-      for (int j = 0; j < spaces_count; ++j) {
+      CFIndex spaces_count = CFArrayGetCount(spaces_ref);
+      for (CFIndex j = 0; j < spaces_count; ++j) {
         CFDictionaryRef space_ref = CFArrayGetValueAtIndex(spaces_ref, j);
+        if (!space_ref
+            || CFGetTypeID(space_ref) != CFDictionaryGetTypeID()) continue;
+
         CFNumberRef sid_ref = CFDictionaryGetValue(space_ref, CFSTR("id64"));
-        CFNumberGetValue(sid_ref,
-                         CFNumberGetType(sid_ref),
-                         space_list + space_count + j);
+        uint64_t sid = 0;
+        if (!sid_ref || CFGetTypeID(sid_ref) != CFNumberGetTypeID()
+            || !CFNumberGetValue(sid_ref, kCFNumberSInt64Type, &sid)) {
+          continue;
+        }
+        if (!append_space_id(&space_list,
+                             &space_count,
+                             &space_capacity,
+                             sid)) {
+          allocation_failed = true;
+          break;
+        }
       }
-      space_count += spaces_count;
     }
     CFRelease(display_spaces_ref);
+  }
+
+  if (allocation_failed || space_count > INT_MAX) {
+    free(space_list);
+    return;
   }
 
   uint64_t set_tags = 1;
@@ -343,8 +1289,10 @@ void windows_add_existing_windows(struct table* windows) {
 
   CFArrayRef space_list_ref = cfarray_of_cfnumbers(space_list,
                                                    sizeof(uint64_t),
-                                                   space_count,
+                                                   (int)space_count,
                                                    kCFNumberSInt64Type);
+  free(space_list);
+  if (!space_list_ref) return;
 
   CFArrayRef window_list_ref = SLSCopyWindowsWithOptionsAndTags(cid,
                                                                 0,
@@ -353,12 +1301,14 @@ void windows_add_existing_windows(struct table* windows) {
                                                                 &set_tags,
                                                                 &clear_tags  );
   if (window_list_ref) {
-    int count = CFArrayGetCount(window_list_ref);
+    CFIndex count = CFArrayGetCount(window_list_ref);
     if (count > 0) {
       CFTypeRef query = SLSWindowQueryWindows(cid, window_list_ref, 0x0);
-      CFTypeRef iterator = SLSWindowQueryResultCopyWindows(query);
+      CFTypeRef iterator = query
+                           ? SLSWindowQueryResultCopyWindows(query)
+                           : NULL;
 
-      while (SLSWindowIteratorAdvance(iterator)) {
+      while (iterator && SLSWindowIteratorAdvance(iterator)) {
         if (window_suitable(iterator)) {
           uint32_t wid = SLSWindowIteratorGetWindowID(iterator);
           windows_window_create(windows, wid, window_space_id(cid, wid));
@@ -366,11 +1316,10 @@ void windows_add_existing_windows(struct table* windows) {
       }
 
       windows_update_notifications(windows);
-      CFRelease(query);
-      CFRelease(iterator);
+      if (query) CFRelease(query);
+      if (iterator) CFRelease(iterator);
     }
     CFRelease(window_list_ref);
   }
   CFRelease(space_list_ref);
-  free(space_list);
 }
